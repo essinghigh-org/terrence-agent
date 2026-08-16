@@ -1,0 +1,219 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use tokio::process::{Child, Command};
+
+use crate::config::Config;
+
+pub struct Sandbox {
+    runner: Option<PathBuf>,
+}
+
+impl Sandbox {
+    pub fn new(config: &Config) -> Self {
+        let runner = config
+            .landlock_runner
+            .clone()
+            .or_else(|| {
+                let local = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("bin")
+                    .join("landlock-runner");
+                local.exists().then_some(local)
+            })
+            .or_else(|| {
+                ["/usr/local/bin/landlock-runner", "/usr/bin/landlock-runner"]
+                    .iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.exists())
+            });
+        Self { runner }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.runner.is_some()
+    }
+
+    pub fn command(
+        &self,
+        config: &Config,
+        binary: &Path,
+        args: &[String],
+        cwd: &Path,
+        work_dir: &Path,
+        env: &[(String, String)],
+    ) -> Result<Command> {
+        if !binary.is_absolute() {
+            bail!(
+                "sandboxed command must use an absolute binary path: {}",
+                binary.display()
+            );
+        }
+        let Some(runner) = &self.runner else {
+            bail!("Landlock runner is required but was not found");
+        };
+        let binary_dir = binary
+            .parent()
+            .context("sandboxed binary has no parent directory")?;
+        let resolver_dir = resolv_conf_dir();
+        let mut command = Command::new(runner);
+        command
+            .arg(format!("--rwx={}", work_dir.display()))
+            .arg(format!("--rx={}", binary_dir.display()));
+        for path in system_rule_paths() {
+            command.arg(format!("--rx={}", path.display()));
+        }
+        command.arg("--ro=/etc").arg("--rw-files=/dev");
+        if let Some(path) = resolver_dir {
+            command.arg(format!("--ro={}", path.display()));
+        }
+        command
+            .arg(format!("--cwd={}", cwd.display()))
+            .arg("--")
+            .arg(binary)
+            .args(args);
+        configure_command(&mut command, config, cwd, work_dir, env)?;
+        Ok(command)
+    }
+
+    pub fn plain_command(
+        &self,
+        config: &Config,
+        binary: &Path,
+        args: &[String],
+        cwd: &Path,
+        work_dir: &Path,
+        env: &[(String, String)],
+    ) -> Result<Command> {
+        let mut command = Command::new(binary);
+        command.args(args);
+        configure_command(&mut command, config, cwd, work_dir, env)?;
+        Ok(command)
+    }
+
+    pub fn choose_command(
+        &self,
+        config: &Config,
+        binary: &Path,
+        args: &[String],
+        cwd: &Path,
+        work_dir: &Path,
+        env: &[(String, String)],
+    ) -> Result<Command> {
+        if config.sandbox {
+            self.command(config, binary, args, cwd, work_dir, env)
+        } else {
+            self.plain_command(config, binary, args, cwd, work_dir, env)
+        }
+    }
+
+    pub fn probe(&self) -> Result<Option<String>> {
+        let Some(runner) = &self.runner else {
+            return Ok(None);
+        };
+        let output = std::process::Command::new(runner)
+            .arg("--probe")
+            .output()
+            .context("probe Landlock runner")?;
+        if !output.status.success() {
+            bail!(
+                "Landlock runner probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        ))
+    }
+}
+
+fn configure_command(
+    command: &mut Command,
+    _config: &Config,
+    cwd: &Path,
+    work_dir: &Path,
+    env: &[(String, String)],
+) -> Result<()> {
+    let tmp_dir = work_dir.join("tmp");
+    fs::create_dir_all(&tmp_dir)
+        .with_context(|| format!("create temporary directory {}", tmp_dir.display()))?;
+    command
+        .current_dir(cwd)
+        .env_clear()
+        .envs(env.iter().map(|(key, value)| (key, value)))
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", work_dir)
+        .env("TMPDIR", tmp_dir)
+        .env("TF_IN_AUTOMATION", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    Ok(())
+}
+
+fn system_rule_paths() -> Vec<PathBuf> {
+    [
+        "/bin",
+        "/usr/bin",
+        "/sbin",
+        "/usr/sbin",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .filter(|path| path.exists())
+    .collect()
+}
+
+fn resolv_conf_dir() -> Option<PathBuf> {
+    let path = fs::canonicalize("/etc/resolv.conf").ok()?;
+    (path != Path::new("/etc/resolv.conf"))
+        .then(|| path.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+pub async fn terminate_child(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        #[cfg(unix)]
+        {
+            // The command is started in its own process group. Terminate the
+            // group so providers and local-exec descendants do not survive.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+        }
+    }
+    let _ = child.kill().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::time::Duration;
+
+    #[test]
+    fn discovers_no_runner_without_installation() {
+        let config = Config {
+            address: "https://example.test".to_owned(),
+            token: "token".to_owned(),
+            name: "agent".to_owned(),
+            data_dir: PathBuf::from("/tmp/agent"),
+            single: false,
+            sandbox: false,
+            check_interval: Duration::from_secs(1),
+            log_level: "info".to_owned(),
+            terraform_path: None,
+            tofu_path: None,
+            landlock_runner: Some(PathBuf::from("/does/not/exist")),
+        };
+        let sandbox = Sandbox::new(&config);
+        assert!(!sandbox.enabled() || sandbox.runner.is_some());
+    }
+}
