@@ -19,7 +19,7 @@ impl Phase {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AgentJobPayload {
     #[serde(rename = "type")]
     pub phase: Phase,
@@ -46,7 +46,7 @@ impl AgentJobPayload {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct JobData {
     #[allow(dead_code)]
     pub organization_name: String,
@@ -75,7 +75,7 @@ pub struct JobData {
     pub environment: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct JobContainer {
     #[serde(default)]
     #[allow(dead_code)]
@@ -112,7 +112,7 @@ pub struct JobContainer {
     pub parallelism: Option<u32>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct CompletionJob {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,7 +120,7 @@ pub struct CompletionJob {
     pub data: CompletionData,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct CompletionData {
     pub run_id: String,
     pub operation: String,

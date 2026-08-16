@@ -12,21 +12,19 @@ pub struct Sandbox {
 
 impl Sandbox {
     pub fn new(config: &Config) -> Self {
-        let runner = config
-            .landlock_runner
-            .clone()
-            .or_else(|| {
-                let local = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("bin")
-                    .join("landlock-runner");
-                local.exists().then_some(local)
-            })
-            .or_else(|| {
+        let runner = if let Some(configured) = config.landlock_runner.clone() {
+            usable_runner(&configured).then_some(configured)
+        } else {
+            let local = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("bin")
+                .join("landlock-runner");
+            usable_runner(&local).then_some(local).or_else(|| {
                 ["/usr/local/bin/landlock-runner", "/usr/bin/landlock-runner"]
                     .iter()
                     .map(PathBuf::from)
-                    .find(|path| path.exists())
-            });
+                    .find(|path| usable_runner(path))
+            })
+        };
         Self { runner }
     }
 
@@ -36,7 +34,6 @@ impl Sandbox {
 
     pub fn command(
         &self,
-        config: &Config,
         binary: &Path,
         args: &[String],
         cwd: &Path,
@@ -72,13 +69,12 @@ impl Sandbox {
             .arg("--")
             .arg(binary)
             .args(args);
-        configure_command(&mut command, config, cwd, work_dir, env)?;
+        configure_command(&mut command, cwd, work_dir, env)?;
         Ok(command)
     }
 
     pub fn plain_command(
         &self,
-        config: &Config,
         binary: &Path,
         args: &[String],
         cwd: &Path,
@@ -87,7 +83,7 @@ impl Sandbox {
     ) -> Result<Command> {
         let mut command = Command::new(binary);
         command.args(args);
-        configure_command(&mut command, config, cwd, work_dir, env)?;
+        configure_command(&mut command, cwd, work_dir, env)?;
         Ok(command)
     }
 
@@ -101,9 +97,9 @@ impl Sandbox {
         env: &[(String, String)],
     ) -> Result<Command> {
         if config.sandbox {
-            self.command(config, binary, args, cwd, work_dir, env)
+            self.command(binary, args, cwd, work_dir, env)
         } else {
-            self.plain_command(config, binary, args, cwd, work_dir, env)
+            self.plain_command(binary, args, cwd, work_dir, env)
         }
     }
 
@@ -129,7 +125,6 @@ impl Sandbox {
 
 fn configure_command(
     command: &mut Command,
-    _config: &Config,
     cwd: &Path,
     work_dir: &Path,
     env: &[(String, String)],
@@ -152,6 +147,23 @@ fn configure_command(
         command.process_group(0);
     }
     Ok(())
+}
+
+fn usable_runner(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn system_rule_paths() -> Vec<PathBuf> {
@@ -179,14 +191,17 @@ fn resolv_conf_dir() -> Option<PathBuf> {
 }
 
 pub async fn terminate_child(child: &mut Child) {
-    if let Some(pid) = child.id() {
-        #[cfg(unix)]
-        {
-            // The command is started in its own process group. Terminate the
-            // group so providers and local-exec descendants do not survive.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGTERM);
-            }
+    let pid = child.id();
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // Commands run in their own process group. Give Terraform and
+        // providers a short grace period, then terminate the whole group.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
         }
     }
     let _ = child.kill().await;
@@ -214,6 +229,6 @@ mod tests {
             landlock_runner: Some(PathBuf::from("/does/not/exist")),
         };
         let sandbox = Sandbox::new(&config);
-        assert!(!sandbox.enabled() || sandbox.runner.is_some());
+        assert!(!sandbox.enabled());
     }
 }

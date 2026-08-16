@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Cursor;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,7 +36,6 @@ pub struct Runner {
     sandbox: Sandbox,
 }
 
-#[derive(Debug)]
 pub struct JobOutcome {
     pub completion: CompletionJob,
 }
@@ -372,7 +371,13 @@ impl Runner {
                 })
             }
             Phase::Apply => {
-                let counts = read_plan_metadata(work_dir).unwrap_or_default();
+                let counts = read_plan_metadata(work_dir).unwrap_or_else(|| {
+                    warn!(
+                        run_id = %payload.data.run_id,
+                        "plan metadata missing from snapshot; reporting zero resource counts"
+                    );
+                    PlanCounts::default()
+                });
                 let apply_args = vec![
                     "apply".to_owned(),
                     "-no-color".to_owned(),
@@ -463,17 +468,18 @@ impl Runner {
         if data.terraform_url.is_empty() || data.terraform_checksum.is_empty() {
             bail!("Terraform is not installed and the server did not provide a verified download");
         }
-        let version = if container.terraform_version.is_empty() {
-            "latest"
+        let cache_key = if container.terraform_version.is_empty() {
+            data.terraform_checksum.to_ascii_lowercase()
         } else {
-            container.terraform_version.as_str()
+            container.terraform_version.clone()
         };
+        validate_identifier(&cache_key, "Terraform cache key")?;
         let cache_dir = self
             .config
             .data_dir
             .join("bin")
             .join("terraform")
-            .join(version);
+            .join(&cache_key);
         let cached = cache_dir.join("terraform");
         if cached.exists() {
             return validate_executable(&cached);
@@ -499,7 +505,12 @@ impl Runner {
             if file.is_dir() || file.name() != "terraform" {
                 continue;
             }
-            let mut output = File::create(&cached)?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o700)
+                .open(&cached)?;
             std::io::copy(&mut file, &mut output)?;
             output.sync_all()?;
             extracted = true;
@@ -731,6 +742,7 @@ fn working_directory(work_dir: &Path, value: &str) -> Result<PathBuf> {
 fn validate_identifier(value: &str, label: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 200
+        || value.bytes().all(|byte| byte == b'.')
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -959,11 +971,14 @@ where
 {
     let mut delay = Duration::from_millis(100);
     let mut last_error = None;
-    for _ in 0..3 {
+    for attempt in 0..3 {
         match request().await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
+                if attempt == 2 {
+                    break;
+                }
                 time::sleep(delay).await;
                 delay = delay.saturating_mul(2);
             }
@@ -982,6 +997,14 @@ mod tests {
         assert_eq!(parse_job_timeout("1h"), Duration::from_secs(3_600));
         assert_eq!(parse_job_timeout("30m"), Duration::from_secs(1_800));
         assert_eq!(parse_job_timeout("bad"), DEFAULT_JOB_TIMEOUT);
+    }
+
+    #[test]
+    fn rejects_dot_only_identifiers() {
+        assert!(validate_identifier(".", "id").is_err());
+        assert!(validate_identifier("..", "id").is_err());
+        assert!(validate_identifier("...", "id").is_err());
+        assert!(validate_identifier("run-1", "id").is_ok());
     }
 
     #[test]
