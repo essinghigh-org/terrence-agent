@@ -21,11 +21,20 @@ pub fn extract_tar_gz(bytes: &[u8], destination: &Path) -> Result<()> {
 
     for entry in archive.entries().context("read tar archive entries")? {
         let mut entry = entry.context("read tar archive entry")?;
+        let entry_type = entry.header().entry_type();
+        if matches!(
+            entry_type,
+            EntryType::XHeader
+                | EntryType::XGlobalHeader
+                | EntryType::GNULongName
+                | EntryType::GNULongLink
+        ) {
+            continue;
+        }
         let relative = validate_entry_path(&entry.path().context("read tar entry path")?)?;
         if relative.as_os_str().is_empty() {
             continue;
         }
-        let entry_type = entry.header().entry_type();
         let output = destination.join(&relative);
         if entry_type == EntryType::Directory {
             fs::create_dir_all(&output)
@@ -51,7 +60,8 @@ pub fn extract_tar_gz(bytes: &[u8], destination: &Path) -> Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&output, fs::Permissions::from_mode(mode & 0o777))?;
+                let safe_mode = if mode & 0o111 != 0 { 0o700 } else { 0o600 };
+                fs::set_permissions(&output, fs::Permissions::from_mode(safe_mode))?;
             }
         }
     }
@@ -81,7 +91,18 @@ pub fn flatten_single_directory(destination: &Path) -> Result<()> {
 pub fn pack_tar_gz(source: &Path) -> Result<Vec<u8>> {
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut builder = Builder::new(encoder);
-    for entry in WalkDir::new(source).follow_links(false) {
+    let walker = WalkDir::new(source)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.path() == source
+                || entry
+                    .path()
+                    .strip_prefix(source)
+                    .map(|relative| !is_excluded(relative))
+                    .unwrap_or(false)
+        });
+    for entry in walker {
         let entry = entry.context("walk snapshot directory")?;
         let path = entry.path();
         if path == source {
@@ -90,12 +111,6 @@ pub fn pack_tar_gz(source: &Path) -> Result<Vec<u8>> {
         let relative = path
             .strip_prefix(source)
             .context("snapshot path is outside its source directory")?;
-        if is_excluded(relative) {
-            if entry.file_type().is_dir() {
-                continue;
-            }
-            continue;
-        }
         if entry.file_type().is_symlink() {
             bail!(
                 "snapshot contains unsupported symlink {}",
@@ -182,6 +197,20 @@ mod tests {
         flatten_single_directory(destination.path()).unwrap();
         assert!(destination.path().join("main.tf").exists());
         assert!(!destination.path().join("repo").exists());
+    }
+
+    #[test]
+    fn handles_long_paths_with_tar_metadata() {
+        let source = tempdir().unwrap();
+        let long_name = format!("{}.tf", "a".repeat(140));
+        fs::write(source.path().join(&long_name), b"resource {} ").unwrap();
+        let archive = pack_tar_gz(source.path()).unwrap();
+        let destination = tempdir().unwrap();
+        extract_tar_gz(&archive, destination.path()).unwrap();
+        assert_eq!(
+            fs::read(destination.path().join(long_name)).unwrap(),
+            b"resource {} "
+        );
     }
 
     #[test]

@@ -16,8 +16,8 @@ RUN case "${TARGETARCH}" in \
       *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac \
  && rustup target add "$(cat /tmp/rust-target)" \
- && cargo build --release --target "$(cat /tmp/rust-target)" \
- && cc -O2 -static -s -o /tmp/landlock-runner bin/landlock-runner.c \
+ && cargo build --release --locked --target "$(cat /tmp/rust-target)" \
+ && cc -O2 -Wall -Wextra -static -s -o /tmp/landlock-runner bin/landlock-runner.c \
  && mkdir -p /out \
  && cp "target/$(cat /tmp/rust-target)/release/terrence-agent" /out/terrence-agent
 

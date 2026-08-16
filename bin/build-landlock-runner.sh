@@ -4,5 +4,13 @@
 set -eu
 cd "$(dirname "$0")"
 gcc -static -O2 -Wall -Wextra -o landlock-runner landlock-runner.c
-./landlock-runner --probe
+if ./landlock-runner --probe; then
+  :
+else
+  status=$?
+  if [ "$status" -ne 2 ]; then
+    exit "$status"
+  fi
+  echo "warning: Landlock is unavailable on this host; the binary was still built" >&2
+fi
 echo "built: $(pwd)/landlock-runner"

@@ -1302,6 +1302,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "libc",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

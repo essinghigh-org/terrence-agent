@@ -156,7 +156,7 @@ static int probe(void) {
 static void usage(void) {
     fprintf(stderr,
         "usage: landlock-runner --probe\n"
-        "   or: landlock-runner (--rwx=PATH | --rw=PATH | --rw-files=PATH | --rx=PATH | --ro=PATH)* [--cwd=DIR] -- CMD [ARGS...]\n");
+        "   or: landlock-runner (--rwx=PATH | --rw=PATH | --rw-files=PATH | --rx=PATH | --ro=PATH)* [--cwd=DIR] -- ABSOLUTE_CMD [ARGS...]\n");
 }
 
 int main(int argc, char **argv) {
@@ -268,7 +268,12 @@ int main(int argc, char **argv) {
         return 126;
     }
 
-    execvp(argv[cmd_start], &argv[cmd_start]);
+    if (argv[cmd_start][0] != '/') {
+        fprintf(stderr, "landlock-runner: command must be an absolute path: %s\n",
+                argv[cmd_start]);
+        return 126;
+    }
+    execv(argv[cmd_start], &argv[cmd_start]);
     fprintf(stderr, "landlock-runner: exec '%s': %s\n",
             argv[cmd_start], strerror(errno));
     return (errno == ENOENT) ? 127 : 126;

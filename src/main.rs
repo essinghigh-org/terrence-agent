@@ -5,6 +5,10 @@ mod protocol;
 mod runner;
 mod sandbox;
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -42,25 +46,37 @@ async fn main() -> Result<()> {
     register_with_retry(&client).await?;
     info!(name = %config.name, address = %config.address, "terrence-agent started");
 
-    loop {
-        tokio::select! {
-            result = poll_once(&client, &runner, &config) => {
-                if let Err(error) = result {
-                    if matches!(error.downcast_ref::<ClientError>(), Some(ClientError::Auth(_))) {
-                        warn!(error = %error, "agent authentication failed; re-registering");
-                        register_with_retry(&client).await?;
-                    } else {
-                        warn!(error = %error, "agent check-in failed");
-                    }
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal_shutdown = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            info!("shutdown requested; finishing the current job");
+            signal_shutdown.store(true, Ordering::SeqCst);
+        }
+    });
+
+    while !shutdown.load(Ordering::SeqCst) {
+        let completed_single_job = match poll_once(&client, &runner, &config).await {
+            Ok(completed_single_job) => completed_single_job,
+            Err(error) => {
+                if matches!(
+                    error.downcast_ref::<ClientError>(),
+                    Some(ClientError::Auth(_))
+                ) {
+                    warn!(error = %error, "agent authentication failed; re-registering");
+                    register_with_retry(&client).await?;
+                } else {
+                    warn!(error = %error, "agent check-in failed");
                 }
+                false
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("shutdown requested");
-                return Ok(());
-            }
+        };
+        if completed_single_job || shutdown.load(Ordering::SeqCst) {
+            return Ok(());
         }
         time::sleep(splayed(config.check_interval)).await;
     }
+    Ok(())
 }
 
 async fn register_with_retry(client: &Client) -> Result<()> {
@@ -83,10 +99,10 @@ async fn register_with_retry(client: &Client) -> Result<()> {
     }
 }
 
-async fn poll_once(client: &Client, runner: &Runner, config: &Config) -> Result<()> {
+async fn poll_once(client: &Client, runner: &Runner, config: &Config) -> Result<bool> {
     let payload = match client.claim().await? {
         Some(payload) => payload,
-        None => return Ok(()),
+        None => return Ok(false),
     };
     info!(
         phase = payload.phase.as_str(),
@@ -103,9 +119,9 @@ async fn poll_once(client: &Client, runner: &Runner, config: &Config) -> Result<
     report_completion(client, &payload, outcome.completion).await?;
     if config.single {
         info!("single-job mode complete");
-        std::process::exit(0);
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn report_completion(
@@ -128,16 +144,11 @@ async fn report_completion(
 fn splayed(base: Duration) -> Duration {
     let base_ms = base.as_millis() as u64;
     let jitter = (base_ms.saturating_mul(3) / 2).max(1);
-    Duration::from_millis(base_ms.saturating_add(randless_jitter(jitter)))
+    Duration::from_millis(base_ms.saturating_add(rand_jitter(jitter)))
 }
 
-fn randless_jitter(max: u64) -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.subsec_nanos() as u64)
-        .unwrap_or(0);
-    nanos % max
+fn rand_jitter(max: u64) -> u64 {
+    rand::random::<u64>() % max
 }
 
 fn init_logging(level: &str) {

@@ -14,6 +14,7 @@ use crate::config::{Config, architecture, operating_system};
 use crate::protocol::{AgentJobPayload, CompletionJob};
 
 const MAX_ERROR_BODY_BYTES: usize = 1 << 20;
+const MAX_JOB_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -86,7 +87,7 @@ impl Client {
         let request = self
             .http
             .post(self.api_url("/api/agent/register"))
-            .headers(self.auth_headers())
+            .headers(self.auth_headers()?)
             .header("content-type", "application/json")
             .header("tfc-agent-version", env!("CARGO_PKG_VERSION"))
             .json(&body);
@@ -138,7 +139,7 @@ impl Client {
         if !response.status().is_success() {
             return Err(self.http_error(response, "/api/agent/jobs").await);
         }
-        let bytes = limited_bytes(response, "/api/agent/jobs", MAX_ERROR_BODY_BYTES).await?;
+        let bytes = limited_bytes(response, "/api/agent/jobs", MAX_JOB_PAYLOAD_BYTES).await?;
         serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|source| ClientError::Decode {
@@ -217,14 +218,14 @@ impl Client {
         }
     }
 
-    fn auth_headers(&self) -> reqwest::header::HeaderMap {
+    fn auth_headers(&self) -> Result<reqwest::header::HeaderMap, ClientError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            header::HeaderValue::from_str(&format!("Bearer {}", self.config.token))
-                .expect("agent token must be a valid HTTP header value"),
-        );
-        headers
+        let authorization = header::HeaderValue::from_str(&format!("Bearer {}", self.config.token))
+            .map_err(|_| {
+                ClientError::Auth("agent token is not a valid HTTP header value".to_owned())
+            })?;
+        headers.insert(header::AUTHORIZATION, authorization);
+        Ok(headers)
     }
 
     async fn agent_headers(&self) -> Result<reqwest::header::HeaderMap, ClientError> {
@@ -232,7 +233,7 @@ impl Client {
         let Some(agent_id) = agent_id else {
             return Err(ClientError::Auth("agent is not registered".to_owned()));
         };
-        let mut headers = self.auth_headers();
+        let mut headers = self.auth_headers()?;
         headers.insert(
             "tfc-agent-id",
             header::HeaderValue::from_str(&agent_id)

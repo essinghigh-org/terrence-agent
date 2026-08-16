@@ -30,6 +30,9 @@ impl Config {
         if token.is_empty() {
             bail!("TERRENCE_AGENT_TOKEN is required");
         }
+        if !token.is_ascii() || token.chars().any(char::is_control) {
+            bail!("TERRENCE_AGENT_TOKEN must contain only visible ASCII characters");
+        }
 
         let data_dir = env_value(&["TERRENCE_AGENT_DATA_DIR", "TFC_AGENT_DATA_DIR"])
             .map(PathBuf::from)
@@ -130,6 +133,11 @@ mod tests {
 
     #[test]
     fn maps_supported_architectures() {
-        assert!(matches!(architecture(), "amd64" | "arm64" | _));
+        let arch = architecture();
+        match std::env::consts::ARCH {
+            "x86_64" => assert_eq!(arch, "amd64"),
+            "aarch64" => assert_eq!(arch, "arm64"),
+            other => assert_eq!(arch, other),
+        }
     }
 }
