@@ -305,13 +305,9 @@ impl Client {
 
     async fn http_error(&self, response: reqwest::Response, path: &str) -> ClientError {
         let status = response.status();
-        let body = response
-            .bytes()
+        let body = limited_bytes(response, path, MAX_ERROR_BODY_BYTES)
             .await
-            .map(|bytes| {
-                String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)])
-                    .into_owned()
-            })
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_else(|_| "<unable to read response body>".to_owned());
         ClientError::Http {
             path: path.to_owned(),
