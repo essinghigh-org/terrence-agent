@@ -39,10 +39,12 @@ for an unsupported IaC binary.
 | `TERRENCE_AGENT_TOKEN` | required | Agent pool token |
 | `TERRENCE_AGENT_NAME` | hostname | Registered agent name |
 | `TERRENCE_AGENT_DATA_DIR` | `~/.terrence-agent` | Run and binary cache |
+| `TERRENCE_AGENT_CACHE_DIR` | `<data_dir>/cache` | IaC binary cache (separate from run data) |
 | `TERRENCE_AGENT_SINGLE` | `false` | Claim one job and exit |
 | `TERRENCE_AGENT_SANDBOX` | `true` | Require Landlock for IaC commands |
 | `TERRENCE_AGENT_CHECK_INTERVAL_MS` | `2000` | Empty-pool polling floor |
 | `TERRENCE_AGENT_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, or `error` |
+| `TERRENCE_AGENT_LOG_JSON` | `false` | Emit structured JSON logs |
 | `TERRENCE_AGENT_TERRAFORM` | PATH lookup | Explicit Terraform binary |
 | `TERRENCE_AGENT_TOFU` | PATH lookup | Explicit OpenTofu binary |
 | `TERRENCE_LANDLOCK_RUNNER` | image helper | Explicit Landlock helper |

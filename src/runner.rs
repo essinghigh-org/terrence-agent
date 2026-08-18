@@ -476,9 +476,7 @@ impl Runner {
         validate_identifier(&cache_key, "Terraform cache key")?;
         let cache_dir = self
             .config
-            .data_dir
-            .join("bin")
-            .join("terraform")
+            .cache_dir
             .join(&cache_key);
         let cached = cache_dir.join("terraform");
         if cached.exists() {

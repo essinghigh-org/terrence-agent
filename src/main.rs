@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_env()?;
-    init_logging(&config.log_level);
+    init_logging(&config.log_level, config.log_json);
     tokio::fs::create_dir_all(&config.data_dir)
         .await
         .with_context(|| format!("create data directory {}", config.data_dir.display()))?;
@@ -151,12 +151,13 @@ fn rand_jitter(max: u64) -> u64 {
     rand::random::<u64>() % max
 }
 
-fn init_logging(level: &str) {
+fn init_logging(level: &str, json: bool) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
-        .init();
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
+    if json {
+        builder.json().init();
+    } else {
+        builder.compact().init();
+    }
 }

@@ -10,10 +10,12 @@ pub struct Config {
     pub token: String,
     pub name: String,
     pub data_dir: PathBuf,
+    pub cache_dir: PathBuf,
     pub single: bool,
     pub sandbox: bool,
     pub check_interval: Duration,
     pub log_level: String,
+    pub log_json: bool,
     pub terraform_path: Option<PathBuf>,
     pub tofu_path: Option<PathBuf>,
     pub landlock_runner: Option<PathBuf>,
@@ -37,6 +39,9 @@ impl Config {
         let data_dir = env_value(&["TERRENCE_AGENT_DATA_DIR", "TFC_AGENT_DATA_DIR"])
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join(".terrence-agent"));
+        let cache_dir = env_value(&["TERRENCE_AGENT_CACHE_DIR", "TFC_AGENT_CACHE_DIR"])
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("cache"));
         let name = env_value(&["TERRENCE_AGENT_NAME", "TFC_AGENT_NAME"])
             .unwrap_or_else(default_agent_name);
         let check_interval_ms = parse_u64(
@@ -53,12 +58,17 @@ impl Config {
         ) {
             bail!("TERRENCE_AGENT_LOG_LEVEL must be trace, debug, info, warn, or error");
         }
+        let log_json = parse_bool(
+            env_value(&["TERRENCE_AGENT_LOG_JSON", "TFC_AGENT_LOG_JSON"]).as_deref(),
+            false,
+        )?;
 
         Ok(Self {
             address,
             token,
             name,
             data_dir,
+            cache_dir,
             single: parse_bool(
                 env_value(&["TERRENCE_AGENT_SINGLE", "TFC_AGENT_SINGLE"]).as_deref(),
                 false,
@@ -66,6 +76,7 @@ impl Config {
             sandbox: parse_bool(env_value(&["TERRENCE_AGENT_SANDBOX"]).as_deref(), true)?,
             check_interval: Duration::from_millis(check_interval_ms),
             log_level,
+            log_json,
             terraform_path: env_value(&["TERRENCE_AGENT_TERRAFORM"]).map(PathBuf::from),
             tofu_path: env_value(&["TERRENCE_AGENT_TOFU"]).map(PathBuf::from),
             landlock_runner: env_value(&["TERRENCE_LANDLOCK_RUNNER"]).map(PathBuf::from),
@@ -122,6 +133,11 @@ pub fn operating_system() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Env-var-mutating tests run against the shared process environment, so they
+    // must not execute concurrently with each other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parses_boolean_variants() {
@@ -129,6 +145,58 @@ mod tests {
         assert!(!parse_bool(Some("off"), true).unwrap());
         assert!(parse_bool(None, true).unwrap());
         assert!(parse_bool(Some("maybe"), false).is_err());
+    }
+
+    #[test]
+    fn cache_dir_defaults_under_data_dir_and_accepts_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // The cache dir defaults to <data_dir>/cache when unset.
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_CACHE_DIR");
+            std::env::remove_var("TFC_AGENT_CACHE_DIR");
+        }
+        let data = std::env::temp_dir().join("terrence-agent-test-data");
+        unsafe {
+            std::env::set_var("TERRENCE_AGENT_DATA_DIR", &data);
+            std::env::set_var("TERRENCE_AGENT_TOKEN", "tok");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.cache_dir, data.join("cache"));
+
+        // An explicit cache dir overrides the default.
+        let override_dir = std::env::temp_dir().join("terrence-agent-test-cache");
+        unsafe {
+            std::env::set_var("TERRENCE_AGENT_CACHE_DIR", &override_dir);
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.cache_dir, override_dir);
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_CACHE_DIR");
+            std::env::remove_var("TERRENCE_AGENT_DATA_DIR");
+            std::env::remove_var("TERRENCE_AGENT_TOKEN");
+        }
+    }
+
+    #[test]
+    fn log_json_defaults_false_and_accepts_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_LOG_JSON");
+            std::env::remove_var("TFC_AGENT_LOG_JSON");
+            std::env::set_var("TERRENCE_AGENT_TOKEN", "tok");
+        }
+        let config = Config::from_env().unwrap();
+        assert!(!config.log_json);
+
+        unsafe {
+            std::env::set_var("TERRENCE_AGENT_LOG_JSON", "true");
+        }
+        let config = Config::from_env().unwrap();
+        assert!(config.log_json);
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_LOG_JSON");
+            std::env::remove_var("TERRENCE_AGENT_TOKEN");
+        }
     }
 
     #[test]
