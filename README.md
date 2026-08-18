@@ -4,7 +4,7 @@
 Terraform and OpenTofu jobs claimed from an agent pool and executes IaC inside
 a Linux Landlock filesystem sandbox.
 
-Terrence is a Terraform Enterprise-compatible server:
+Terrence provides a Terraform-compatible remote execution API. See:
 
 - <https://github.com/essinghigh-org/terrence>
 - <https://terraform.essinghigh.dev>
@@ -48,8 +48,9 @@ for an unsupported IaC binary.
 | `TERRENCE_LANDLOCK_RUNNER` | image helper | Explicit Landlock helper |
 
 `TFC_ADDRESS`, `TFC_AGENT_TOKEN`, `TFC_AGENT_NAME`, `TFC_AGENT_DATA_DIR`,
-`TFC_AGENT_SINGLE`, and `TFC_AGENT_LOG_LEVEL` are accepted as aliases for
-migration convenience. The wire protocol remains Terrence's protocol.
+`TFC_AGENT_SINGLE`, and `TFC_AGENT_LOG_LEVEL` are accepted as legacy
+compatibility aliases for migration convenience. The wire protocol remains
+Terrence's protocol.
 
 ## Job lifecycle
 
