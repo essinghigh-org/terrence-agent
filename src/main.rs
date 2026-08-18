@@ -47,15 +47,17 @@ async fn main() -> Result<()> {
     info!(name = %config.name, address = %config.address, "terrence-agent started");
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let force_exit = Arc::new(AtomicBool::new(false));
     let signal_shutdown = Arc::clone(&shutdown);
+    let signal_force = Arc::clone(&force_exit);
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            info!("shutdown requested; finishing the current job");
-            signal_shutdown.store(true, Ordering::SeqCst);
-        }
+        wait_for_shutdown(signal_shutdown, signal_force).await;
     });
 
-    while !shutdown.load(Ordering::SeqCst) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         let completed_single_job = match poll_once(&client, &runner, &config).await {
             Ok(completed_single_job) => completed_single_job,
             Err(error) => {
@@ -72,11 +74,54 @@ async fn main() -> Result<()> {
             }
         };
         if completed_single_job || shutdown.load(Ordering::SeqCst) {
-            return Ok(());
+            break;
         }
         time::sleep(splayed(config.check_interval)).await;
     }
+
+    // Graceful shutdown: deregister so the server can reclaim the agent slot.
+    if let Err(error) = client.deregister().await {
+        warn!(error = %error, "agent deregistration failed during shutdown");
+    }
+    info!("terrence-agent stopped");
     Ok(())
+}
+
+/// Wait for a termination signal and request a graceful shutdown.
+///
+/// The first signal sets `shutdown`, letting the agent finish its current job
+/// before exiting (matching the tfc-agent graceful-drain contract). A second
+/// signal forces an immediate exit, mirroring upstream behavior under a tight
+/// shutdown deadline.
+#[cfg(unix)]
+async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, _force_exit: Arc<AtomicBool>) {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut sigquit = signal(SignalKind::quit()).expect("install SIGQUIT handler");
+    let mut first = true;
+    loop {
+        tokio::select! {
+            _ = sigint.recv() => {},
+            _ = sigterm.recv() => {},
+            _ = sigquit.recv() => {},
+        }
+        if first {
+            first = false;
+            info!("shutdown signal received; finishing the current job before exiting");
+            shutdown.store(true, Ordering::SeqCst);
+        } else {
+            warn!("second termination signal received; forcing immediate exit");
+            std::process::exit(0);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, _force_exit: Arc<AtomicBool>) {
+    let _ = tokio::signal::ctrl_c().await;
+    info!("shutdown signal received; finishing the current job before exiting");
+    shutdown.store(true, Ordering::SeqCst);
 }
 
 async fn register_with_retry(client: &Client) -> Result<()> {

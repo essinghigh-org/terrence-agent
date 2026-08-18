@@ -117,12 +117,28 @@ impl Client {
         Ok(())
     }
 
+    pub async fn deregister(&self) -> Result<(), ClientError> {
+        // Best-effort: a graceful shutdown requests deregistration so the
+        // server can free the agent slot. Failures are logged by the caller.
+        let request = self
+            .http
+            .delete(self.api_url("/api/agent/register"))
+            .headers(self.agent_headers().await?);
+        match request.send().await {
+            Ok(_) => Ok(()),
+            Err(source) => Err(ClientError::Network {
+                path: "/api/agent/register".to_owned(),
+                source,
+            }),
+        }
+    }
+
     pub async fn claim(&self) -> Result<Option<AgentJobPayload>, ClientError> {
         let request = self
             .http
             .get(self.api_url("/api/agent/jobs"))
             .headers(self.agent_headers().await?)
-            .header("tfc-agent-accept", "plan,apply");
+            .header("tfc-agent-accept", self.config.accept.clone());
         let response = request
             .send()
             .await
@@ -380,6 +396,7 @@ mod tests {
             check_interval: Duration::from_millis(250),
             log_level: "info".to_owned(),
             log_json: false,
+            accept: "plan,apply".to_owned(),
             terraform_path: None,
             tofu_path: None,
             landlock_runner: None,

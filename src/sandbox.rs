@@ -226,6 +226,7 @@ mod tests {
             check_interval: Duration::from_secs(1),
             log_level: "info".to_owned(),
             log_json: false,
+            accept: "plan,apply".to_owned(),
             terraform_path: None,
             tofu_path: None,
             landlock_runner: Some(PathBuf::from("/does/not/exist")),

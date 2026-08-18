@@ -16,6 +16,7 @@ pub struct Config {
     pub check_interval: Duration,
     pub log_level: String,
     pub log_json: bool,
+    pub accept: String,
     pub terraform_path: Option<PathBuf>,
     pub tofu_path: Option<PathBuf>,
     pub landlock_runner: Option<PathBuf>,
@@ -62,6 +63,10 @@ impl Config {
             env_value(&["TERRENCE_AGENT_LOG_JSON", "TFC_AGENT_LOG_JSON"]).as_deref(),
             false,
         )?;
+        let accept = env_value(&["TERRENCE_AGENT_ACCEPT", "TFC_AGENT_ACCEPT"])
+            .unwrap_or_else(|| "plan,apply".to_owned())
+            .trim()
+            .to_ascii_lowercase();
 
         Ok(Self {
             address,
@@ -77,6 +82,7 @@ impl Config {
             check_interval: Duration::from_millis(check_interval_ms),
             log_level,
             log_json,
+            accept,
             terraform_path: env_value(&["TERRENCE_AGENT_TERRAFORM"]).map(PathBuf::from),
             tofu_path: env_value(&["TERRENCE_AGENT_TOFU"]).map(PathBuf::from),
             landlock_runner: env_value(&["TERRENCE_LANDLOCK_RUNNER"]).map(PathBuf::from),
@@ -173,6 +179,28 @@ mod tests {
         unsafe {
             std::env::remove_var("TERRENCE_AGENT_CACHE_DIR");
             std::env::remove_var("TERRENCE_AGENT_DATA_DIR");
+            std::env::remove_var("TERRENCE_AGENT_TOKEN");
+        }
+    }
+
+    #[test]
+    fn accept_defaults_to_plan_apply_and_accepts_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_ACCEPT");
+            std::env::remove_var("TFC_AGENT_ACCEPT");
+            std::env::set_var("TERRENCE_AGENT_TOKEN", "tok");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.accept, "plan,apply");
+
+        unsafe {
+            std::env::set_var("TERRENCE_AGENT_ACCEPT", "plan,apply,destroy");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.accept, "plan,apply,destroy");
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_ACCEPT");
             std::env::remove_var("TERRENCE_AGENT_TOKEN");
         }
     }
