@@ -25,7 +25,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let address = env_value(&["TERRENCE_ADDRESS", "TFC_ADDRESS"])
-            .unwrap_or_else(|| "https://terraform.essinghigh.dev".to_owned())
+            .unwrap_or_else(|| "https://terraform.example.com".to_owned())
             .trim_end_matches('/')
             .to_owned();
         let token = env_value(&["TERRENCE_AGENT_TOKEN", "TFC_AGENT_TOKEN"])

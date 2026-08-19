@@ -7,7 +7,7 @@ a Linux Landlock filesystem sandbox.
 Terrence provides a Terraform-compatible remote execution API. See:
 
 - <https://github.com/essinghigh-org/terrence>
-- <https://terraform.essinghigh.dev>
+- <https://terraform.example.com>
 
 The agent is independently implemented. Compatibility means the HTTP protocol,
 not tfc-agent's internal implementation or configuration model.
@@ -35,7 +35,7 @@ for an unsupported IaC binary.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TERRENCE_ADDRESS` | `https://terraform.essinghigh.dev` | Terrence API base URL |
+| `TERRENCE_ADDRESS` | `https://terraform.example.com` | Terrence API base URL |
 | `TERRENCE_AGENT_TOKEN` | required | Agent pool token |
 | `TERRENCE_AGENT_NAME` | hostname | Registered agent name |
 | `TERRENCE_AGENT_DATA_DIR` | `~/.terrence-agent` | Run and binary cache |

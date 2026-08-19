@@ -677,7 +677,7 @@ fn registry_hostname(payload: &AgentJobPayload, container: &JobContainer) -> Str
             }
         }
     }
-    "terraform.essinghigh.dev".to_owned()
+    "terraform.example.com".to_owned()
 }
 
 fn run_token<'a>(payload: &'a AgentJobPayload, container: &'a JobContainer) -> &'a str {
