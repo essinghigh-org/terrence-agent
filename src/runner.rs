@@ -1,20 +1,17 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::Cursor;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::warn;
-use zip::ZipArchive;
 
 use crate::archive::{extract_tar_gz, flatten_single_directory, pack_tar_gz};
 use crate::client::Client;
@@ -24,6 +21,7 @@ use crate::protocol::{
     state_outputs,
 };
 use crate::sandbox::{Sandbox, terminate_child};
+use crate::toolchain::{Product, ToolchainResolver};
 
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(750);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -34,6 +32,7 @@ pub struct Runner {
     client: Client,
     config: Config,
     sandbox: Sandbox,
+    toolchain: ToolchainResolver,
 }
 
 pub struct JobOutcome {
@@ -74,10 +73,12 @@ impl Runner {
     pub fn new(client: Client) -> Self {
         let config = client.config().clone();
         let sandbox = Sandbox::new(&config);
+        let toolchain = ToolchainResolver::new(config.cache_dir.clone());
         Self {
             client,
             config,
             sandbox,
+            toolchain,
         }
     }
 
@@ -458,79 +459,37 @@ impl Runner {
         data: &JobData,
         container: &JobContainer,
     ) -> Result<PathBuf> {
+        let product = match name {
+            "terraform" => Product::Terraform,
+            "tofu" => Product::OpenTofu,
+            _ => bail!("unsupported IaC binary requested by Terrence: {name}"),
+        };
         let configured = match name {
             "terraform" => self.config.terraform_path.as_deref(),
             "tofu" => self.config.tofu_path.as_deref(),
             _ => None,
         };
-        if let Some(path) = configured {
-            return validate_executable(path);
-        }
-        if let Some(path) = find_in_path(name) {
-            return Ok(path);
-        }
-        for path in [
-            PathBuf::from(format!("/opt/iac/{name}")),
-            PathBuf::from(format!("/usr/local/bin/{name}")),
-        ] {
-            if path.exists() {
-                return validate_executable(&path);
-            }
-        }
-        if name != "terraform" {
-            bail!("tofu job requested but no tofu binary is installed");
-        }
-        if data.terraform_url.is_empty() || data.terraform_checksum.is_empty() {
-            bail!("Terraform is not installed and the server did not provide a verified download");
-        }
-        let cache_key = if container.terraform_version.is_empty() {
-            data.terraform_checksum.to_ascii_lowercase()
-        } else {
-            container.terraform_version.clone()
-        };
-        validate_identifier(&cache_key, "Terraform cache key")?;
-        let cache_dir = self.config.cache_dir.join(&cache_key);
-        let cached = cache_dir.join("terraform");
-        if cached.exists() {
-            return validate_executable(&cached);
-        }
-        fs::create_dir_all(&cache_dir)?;
-        let archive = self
-            .client
-            .get_artifact(&data.terraform_url)
+        let installed = configured
+            .map(PathBuf::from)
+            .or_else(|| find_in_path(name))
+            .or_else(|| {
+                [
+                    PathBuf::from(format!("/opt/iac/{name}")),
+                    PathBuf::from(format!("/usr/local/bin/{name}")),
+                ]
+                .into_iter()
+                .find(|path| path.is_file())
+            });
+        self.toolchain
+            .resolve(
+                &self.client,
+                product,
+                &container.terraform_version,
+                installed.as_deref(),
+                &data.terraform_url,
+                &data.terraform_checksum,
+            )
             .await
-            .context("download Terraform release")?;
-        let actual = hex_digest(&archive);
-        if !actual.eq_ignore_ascii_case(&data.terraform_checksum) {
-            bail!(
-                "Terraform checksum mismatch: expected {}, got {actual}",
-                data.terraform_checksum
-            );
-        }
-        let mut zip =
-            ZipArchive::new(Cursor::new(archive)).context("open Terraform release archive")?;
-        let mut extracted = false;
-        for index in 0..zip.len() {
-            let mut file = zip.by_index(index)?;
-            if file.is_dir() || file.name() != "terraform" {
-                continue;
-            }
-            let mut output = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o700)
-                .open(&cached)?;
-            std::io::copy(&mut file, &mut output)?;
-            output.sync_all()?;
-            extracted = true;
-            break;
-        }
-        if !extracted {
-            bail!("Terraform release archive did not contain a terraform binary");
-        }
-        fs::set_permissions(&cached, fs::Permissions::from_mode(0o700))?;
-        validate_executable(&cached)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -774,18 +733,6 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn validate_executable(path: &Path) -> Result<PathBuf> {
-    if !path.is_absolute() {
-        bail!("IaC binary path must be absolute: {}", path.display());
-    }
-    let canonical =
-        fs::canonicalize(path).with_context(|| format!("resolve binary {}", path.display()))?;
-    if !canonical.is_file() || !is_executable(&canonical) {
-        bail!("IaC binary is not executable: {}", canonical.display());
-    }
-    Ok(canonical)
-}
-
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -797,12 +744,6 @@ fn is_executable(path: &Path) -> bool {
     {
         path.is_file()
     }
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 fn parse_job_timeout(value: &str) -> Duration {

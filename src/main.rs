@@ -5,6 +5,7 @@ mod diagnostics;
 mod protocol;
 mod runner;
 mod sandbox;
+mod toolchain;
 
 use std::sync::{
     Arc,
