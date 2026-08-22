@@ -41,7 +41,7 @@ impl fmt::Display for SecretString {
 }
 
 pub const DEFAULT_MAX_PARALLELISM: u32 = 64;
-pub const HARD_MAX_PARALLELISM: u64 = 256;
+pub const HARD_MAX_PARALLELISM: u64 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkloadType {
