@@ -139,10 +139,10 @@ impl Client {
         if base_url.host_str().is_none() {
             anyhow::bail!("TERRENCE_ADDRESS must include a host");
         }
-        if let Some(reason) = literal_private_host_reason(&base_url)
-            && !cfg!(test)
-        {
-            anyhow::bail!("TERRENCE_ADDRESS points to {reason}");
+        if !cfg!(test) {
+            if let Some(reason) = literal_private_host_reason(&base_url) {
+                anyhow::bail!("TERRENCE_ADDRESS points to {reason}");
+            }
         }
         let artifact_hosts = env_hosts_any(&[
             "TERRENCE_AGENT_ARTIFACT_HOSTS",
