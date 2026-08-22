@@ -379,6 +379,7 @@ async fn finish_journal_entry(
             run_id = %entry.manifest.run_id,
             "retaining run directory for state recovery"
         );
+        journal.mark_cleanup_done(&entry)?;
         return Ok(());
     }
     runner.cleanup_manifest(&entry.manifest).await?;
