@@ -925,7 +925,7 @@ fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
         .get(header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|seconds| Duration::from_secs(seconds.min(60)))
+        .map(|seconds| Duration::from_secs(seconds.min(300)))
 }
 
 async fn sleep_retry(attempt: usize, retry_after: Option<Duration>) {
