@@ -11,7 +11,9 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::config::{Config, SecretString, architecture, operating_system};
-use crate::protocol::{AgentId, AgentJobPayload, AgentRegistration, CompletionJob, RegisterResponse};
+use crate::protocol::{
+    AgentId, AgentJobPayload, AgentRegistration, CompletionJob, RegisterResponse,
+};
 
 const MAX_ERROR_BODY_BYTES: usize = 1 << 20;
 const MAX_JOB_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -281,13 +283,15 @@ impl Client {
         );
         headers.insert(
             "tfc-agent-instance-id",
-            header::HeaderValue::from_str(&self.config.instance_id)
-                .map_err(|_| ClientError::Auth("agent instance id is not a valid HTTP header value".to_owned()))?,
+            header::HeaderValue::from_str(&self.config.instance_id).map_err(|_| {
+                ClientError::Auth("agent instance id is not a valid HTTP header value".to_owned())
+            })?,
         );
         headers.insert(
             "tfc-agent-session-id",
-            header::HeaderValue::from_str(&self.config.session_id)
-                .map_err(|_| ClientError::Auth("agent session id is not a valid HTTP header value".to_owned()))?,
+            header::HeaderValue::from_str(&self.config.session_id).map_err(|_| {
+                ClientError::Auth("agent session id is not a valid HTTP header value".to_owned())
+            })?,
         );
         Ok(headers)
     }

@@ -142,6 +142,9 @@ fn validate_url(value: &str, allow_empty: bool) -> Result<(), String> {
     if value.is_empty() {
         return Ok(());
     }
+    if value.starts_with('/') {
+        return Ok(());
+    }
     let parsed =
         url::Url::parse(value).map_err(|_| "URL must be an absolute HTTP(S) URL".to_owned())?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -397,7 +400,7 @@ where
         Some(0) => Err(de::Error::custom("parallelism must be greater than zero")),
         Some(value) => Ok(Some(value.min(MAX_PARALLELISM))),
         None => Ok(None),
-}
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

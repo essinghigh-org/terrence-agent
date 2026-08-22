@@ -1075,7 +1075,7 @@ where
 mod tests {
     use super::*;
     use crate::client::Client;
-    use crate::config::Config;
+    use crate::config::{Config, SecretString};
     use crate::protocol::{AgentJobPayload, JobContainer, JobData};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1192,8 +1192,12 @@ mod tests {
     fn test_runner(data_dir: PathBuf) -> Runner {
         let config = Config {
             address: "https://example.test".to_owned(),
-            token: "token".to_owned(),
-            name: "agent".to_owned(),
+            token: SecretString::new("token").unwrap(),
+            token_file: None,
+            display_name: "agent".to_owned(),
+            hostname: "agent".to_owned(),
+            instance_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            session_id: "22222222-2222-4222-8222-222222222222".to_owned(),
             data_dir,
             cache_dir: PathBuf::from("/tmp/terrence-agent-test-cache"),
             single: false,
