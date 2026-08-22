@@ -1,0 +1,46 @@
+[Unit]
+Description=Terrence Terraform/OpenTofu execution agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/terrence-agent
+Restart=on-failure
+RestartSec=5s
+
+# The package is designed to run without a pre-created service account.
+DynamicUser=yes
+StateDirectory=terrence-agent
+CacheDirectory=terrence-agent
+Environment=TERRENCE_AGENT_DATA_DIR=%S/terrence-agent
+Environment=TERRENCE_AGENT_CACHE_DIR=%C/terrence-agent
+Environment=TERRENCE_AGENT_TOKEN_FILE=%d/agent-token
+LoadCredential=agent-token:/etc/terrence-agent/agent-token
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+
+# Keep broad syscall compatibility for Terraform providers while blocking
+# unrelated kernel-control groups. Tighten this only after provider testing.
+SystemCallFilter=~@clock @cpu-emulation @debug @module @obsolete @raw-io @reboot @swap
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+MemoryMax=4G
+TasksMax=512
+CPUQuota=200%
+LimitCORE=0
+TimeoutStopSec=60s
+
+[Install]
+WantedBy=multi-user.target

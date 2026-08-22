@@ -1,0 +1,151 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: terrence-agent
+  labels:
+    app.kubernetes.io/name: terrence-agent
+    terrence.io/pool: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: terrence-agent
+      terrence.io/pool: default
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: terrence-agent
+        terrence.io/pool: default
+    spec:
+      # The agent does not need the Kubernetes API service account.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: terrence-agent
+              terrence.io/pool: default
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: terrence-agent
+              terrence.io/pool: default
+      containers:
+        - name: terrence-agent
+          # Pin this reference to the release digest produced by the image
+          # pipeline before applying a production deployment.
+          image: ghcr.io/essinghigh-org/terrence-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TERRENCE_ADDRESS
+              value: https://terraform.example.com
+            - name: TERRENCE_AGENT_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TERRENCE_AGENT_TOKEN_FILE
+              value: /var/run/secrets/terrence/agent-token
+            - name: TERRENCE_AGENT_DATA_DIR
+              value: /run/terrence
+            - name: TERRENCE_AGENT_CACHE_DIR
+              value: /data/cache
+            - name: TERRENCE_AGENT_SANDBOX
+              value: "true"
+            - name: TERRENCE_AGENT_LOG_JSON
+              value: "true"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: run-storage
+              mountPath: /run/terrence
+            - name: cache
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: agent-token
+              mountPath: /var/run/secrets/terrence
+              readOnly: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+              ephemeral-storage: 8Gi
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/terrence-agent", "check-config"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/terrence-agent", "check-config"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: run-storage
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+        - name: cache
+          persistentVolumeClaim:
+            claimName: terrence-agent-cache
+        - name: agent-token
+          secret:
+            secretName: terrence-agent-token
+            items:
+              - key: token
+                path: agent-token
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: terrence-agent-cache
+  labels:
+    app.kubernetes.io/name: terrence-agent
+    terrence.io/pool: default
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: terrence-agent
+  labels:
+    app.kubernetes.io/name: terrence-agent
+    terrence.io/pool: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: terrence-agent
+      terrence.io/pool: default
