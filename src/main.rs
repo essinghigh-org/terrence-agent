@@ -5,6 +5,7 @@ mod diagnostics;
 mod journal;
 mod manifest;
 mod protocol;
+mod provider_cache;
 mod runner;
 mod sandbox;
 mod toolchain;
@@ -34,6 +35,9 @@ async fn main() -> Result<()> {
     }
     let config = Config::from_env()?;
     init_logging(&config.log_level, config.log_json);
+    if let Some(cache) = provider_cache::ProviderCache::from_env()? {
+        info!(path = %cache.path().display(), "verified immutable provider cache");
+    }
     tokio::fs::create_dir_all(&config.data_dir)
         .await
         .with_context(|| format!("create data directory {}", config.data_dir.display()))?;
