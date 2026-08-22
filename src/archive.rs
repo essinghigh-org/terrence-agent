@@ -527,9 +527,11 @@ fn private_output_file(path: &Path) -> Result<File> {
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    options
+    let file = options
         .open(path)
-        .with_context(|| format!("create snapshot archive {}", path.display()))
+        .with_context(|| format!("create snapshot archive {}", path.display()))?;
+    set_private_file(path, false)?;
+    Ok(file)
 }
 
 fn private_file(path: &Path, executable: bool) -> Result<File> {
