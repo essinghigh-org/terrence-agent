@@ -39,6 +39,7 @@ pub fn extract_tar_gz(bytes: &[u8], destination: &Path) -> Result<()> {
 }
 
 /// Extract a gzip-compressed tar archive directly from a file.
+#[allow(dead_code)]
 pub fn extract_tar_gz_file(archive_path: &Path, destination: &Path) -> Result<()> {
     let metadata = fs::metadata(archive_path)
         .with_context(|| format!("stat archive {}", archive_path.display()))?;
@@ -199,6 +200,7 @@ pub fn pack_tar_gz(source: &Path) -> Result<Vec<u8>> {
 
 /// Pack a snapshot directly to a private file, enforcing the same output cap
 /// as [`pack_tar_gz`].
+#[allow(dead_code)]
 pub fn pack_tar_gz_file(source: &Path, archive_path: &Path) -> Result<()> {
     let source_root = fs::canonicalize(source)
         .with_context(|| format!("canonicalize snapshot directory {}", source.display()))?;
@@ -514,6 +516,7 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 }
 
+#[allow(dead_code)]
 fn private_output_file(path: &Path) -> Result<File> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
