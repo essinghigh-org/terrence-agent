@@ -1,10 +1,12 @@
 use std::env;
 use std::fmt;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use url::Url;
 
 /// A token that does not reveal its value through formatting or debug output.
 #[derive(Clone)]
@@ -88,6 +90,11 @@ impl Config {
             .unwrap_or_else(|| "https://terraform.example.com".to_owned())
             .trim_end_matches('/')
             .to_owned();
+        let allow_insecure_http = parse_bool(
+            env_value(&["TERRENCE_ALLOW_INSECURE_HTTP"]).as_deref(),
+            false,
+        )?;
+        validate_address(&address, allow_insecure_http)?;
         let token_file =
             env_value(&["TERRENCE_AGENT_TOKEN_FILE", "TFC_AGENT_TOKEN_FILE"]).map(PathBuf::from);
         let token = match token_file.as_ref() {
@@ -265,6 +272,52 @@ fn parse_accept_values(value: &str) -> Result<Vec<WorkloadType>> {
         }
     }
     Ok(parsed)
+}
+
+fn validate_address(value: &str, allow_insecure_http: bool) -> Result<()> {
+    let address = Url::parse(value).with_context(|| "TERRENCE_ADDRESS must be a valid URL")?;
+    if address.username() != "" || address.password().is_some() {
+        bail!("TERRENCE_ADDRESS must not contain userinfo");
+    }
+    let Some(host) = address.host_str() else {
+        bail!("TERRENCE_ADDRESS must include a host");
+    };
+    if host.contains('%') {
+        bail!("TERRENCE_ADDRESS host must not contain percent-encoded bytes");
+    }
+    let literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .ok();
+    let metadata_name = matches!(
+        host.trim_end_matches('.').to_ascii_lowercase().as_str(),
+        "metadata.google.internal" | "instance-data.ec2.internal"
+    );
+    let metadata = literal.is_some_and(|ip| match ip {
+        IpAddr::V4(ip) => ip.octets() == [169, 254, 169, 254],
+        IpAddr::V6(ip) => ip
+            .to_ipv4()
+            .is_some_and(|ip| ip.octets() == [169, 254, 169, 254]),
+    });
+    let local = host.eq_ignore_ascii_case("localhost")
+        || literal.is_some_and(|ip| match ip {
+            IpAddr::V4(ip) => ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80
+            }
+        });
+    if metadata_name || metadata || (local && !allow_insecure_http) {
+        bail!("TERRENCE_ADDRESS points to a private or metadata host");
+    }
+    match address.scheme() {
+        "https" => Ok(()),
+        "http" if allow_insecure_http => Ok(()),
+        "http" => bail!(
+            "TERRENCE_ADDRESS must use HTTPS (set TERRENCE_ALLOW_INSECURE_HTTP=true only for local testing)"
+        ),
+        _ => bail!("TERRENCE_ADDRESS must use HTTPS"),
+    }
 }
 
 fn env_value(names: &[&str]) -> Option<String> {
