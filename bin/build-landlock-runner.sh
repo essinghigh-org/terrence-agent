@@ -13,7 +13,7 @@ cd "$script_dir"
 
 "$CC" \
   -std=c11 -O2 -Wall -Wextra -Werror \
-  -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE \
+  -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -fstack-protector-strong -fPIE \
   -static-pie -s \
   -Wl,-z,relro,-z,now,-z,noexecstack \
   -o landlock-runner landlock-runner.c
