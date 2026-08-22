@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -40,6 +40,25 @@ impl fmt::Display for SecretString {
     }
 }
 
+pub const DEFAULT_MAX_PARALLELISM: u32 = 64;
+pub const HARD_MAX_PARALLELISM: u64 = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkloadType {
+    Plan,
+    Apply,
+}
+
+impl WorkloadType {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "plan" => Some(Self::Plan),
+            "apply" => Some(Self::Apply),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub address: String,
@@ -57,6 +76,7 @@ pub struct Config {
     pub log_level: String,
     pub log_json: bool,
     pub accept: String,
+    pub max_parallelism: u32,
     pub terraform_path: Option<PathBuf>,
     pub tofu_path: Option<PathBuf>,
     pub landlock_runner: Option<PathBuf>,
@@ -115,10 +135,30 @@ impl Config {
             env_value(&["TERRENCE_AGENT_LOG_JSON", "TFC_AGENT_LOG_JSON"]).as_deref(),
             false,
         )?;
-        let accept = env_value(&["TERRENCE_AGENT_ACCEPT", "TFC_AGENT_ACCEPT"])
-            .unwrap_or_else(|| "plan,apply".to_owned())
-            .trim()
-            .to_ascii_lowercase();
+        let accept = parse_accept(
+            env_value(&["TERRENCE_AGENT_ACCEPT", "TFC_AGENT_ACCEPT"])
+                .unwrap_or_else(|| "plan,apply".to_owned()),
+        )?;
+        let max_parallelism = parse_u64(
+            env_value(&[
+                "TERRENCE_AGENT_MAX_PARALLELISM",
+                "TFC_AGENT_MAX_PARALLELISM",
+            ])
+            .as_deref(),
+            u64::from(DEFAULT_MAX_PARALLELISM),
+        )?;
+        if max_parallelism == 0 {
+            bail!("TERRENCE_AGENT_MAX_PARALLELISM must be greater than zero");
+        }
+        let max_parallelism = max_parallelism.min(HARD_MAX_PARALLELISM) as u32;
+        let terraform_path = env_value(&["TERRENCE_AGENT_TERRAFORM"]).map(PathBuf::from);
+        if terraform_path.as_deref().is_some_and(|path| !is_executable(path)) {
+            bail!("TERRENCE_AGENT_TERRAFORM must point to an executable absolute path");
+        }
+        let tofu_path = env_value(&["TERRENCE_AGENT_TOFU"]).map(PathBuf::from);
+        if tofu_path.as_deref().is_some_and(|path| !is_executable(path)) {
+            bail!("TERRENCE_AGENT_TOFU must point to an executable absolute path");
+        }
 
         Ok(Self {
             address,
@@ -139,8 +179,9 @@ impl Config {
             log_level,
             log_json,
             accept,
-            terraform_path: env_value(&["TERRENCE_AGENT_TERRAFORM"]).map(PathBuf::from),
-            tofu_path: env_value(&["TERRENCE_AGENT_TOFU"]).map(PathBuf::from),
+            max_parallelism,
+            terraform_path,
+            tofu_path,
             landlock_runner: env_value(&["TERRENCE_LANDLOCK_RUNNER"]).map(PathBuf::from),
         })
     }
@@ -154,6 +195,22 @@ impl Config {
             None => Ok(self.token.clone()),
         }
     }
+
+    /// Return the IaC binaries this agent can resolve before registration.
+    /// Terraform also has the verified server-provided download fallback;
+    /// OpenTofu does not, so it is advertised only when installed locally.
+    pub fn iac_binaries(&self) -> Vec<&'static str> {
+        let mut binaries = Vec::with_capacity(2);
+        if self.terraform_path.as_deref().is_none_or(is_executable) {
+            binaries.push("terraform");
+        }
+        if self.tofu_path.as_deref().is_some_and(is_executable)
+            || (self.tofu_path.is_none() && find_in_path("tofu"))
+        {
+            binaries.push("tofu");
+        }
+        binaries
+    }
 }
 
 fn validate_token(value: &str) -> Result<()> {
@@ -164,6 +221,44 @@ fn validate_token(value: &str) -> Result<()> {
         bail!("agent token must contain only visible ASCII characters");
     }
     Ok(())
+}
+
+pub fn parse_accept(value: String) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "none" {
+        return Ok(normalized);
+    }
+    let values = parse_accept_values(&normalized)?;
+    if values.is_empty() {
+        bail!("TERRENCE_AGENT_ACCEPT must contain plan, apply, or none");
+    }
+    Ok(values
+        .into_iter()
+        .map(|value| match value {
+            WorkloadType::Plan => "plan",
+            WorkloadType::Apply => "apply",
+        })
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+fn parse_accept_values(value: &str) -> Result<Vec<WorkloadType>> {
+    if value == "none" {
+        return Ok(Vec::new());
+    }
+    let mut parsed = Vec::new();
+    for token in value.split(',').map(str::trim) {
+        if token.is_empty() {
+            bail!("TERRENCE_AGENT_ACCEPT contains an empty workload");
+        }
+        let Some(workload) = WorkloadType::parse(token) else {
+            bail!("unsupported TERRENCE_AGENT_ACCEPT workload: {token}");
+        };
+        if !parsed.contains(&workload) {
+            parsed.push(workload);
+        }
+    }
+    Ok(parsed)
 }
 
 fn env_value(names: &[&str]) -> Option<String> {
@@ -194,6 +289,36 @@ fn home_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+fn is_executable(path: &Path) -> bool {
+    if !path.is_absolute() || !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn find_in_path(name: &str) -> bool {
+    let path_match = env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(name))
+        .any(|path| is_executable(&path));
+    path_match
+        || ["/opt/iac", "/usr/local/bin"]
+            .into_iter()
+            .map(|directory| Path::new(directory).join(name))
+            .any(|path| is_executable(&path))
 }
 
 fn default_agent_name() -> String {
@@ -298,14 +423,14 @@ mod tests {
             std::env::set_var("TERRENCE_AGENT_TOKEN_FILE", &token_path);
         }
         let config = Config::from_env().unwrap();
-        assert_eq!(config.token, "file-token");
+        assert_eq!(config.token.expose_secret(), "file-token");
         unsafe {
             std::env::remove_var("TERRENCE_AGENT_TOKEN_FILE");
         }
     }
 
     #[test]
-    fn accept_defaults_to_plan_apply_and_accepts_override() {
+    fn accept_defaults_to_plan_apply_and_rejects_unsupported_workloads() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("TERRENCE_AGENT_ACCEPT");
@@ -318,14 +443,50 @@ mod tests {
         assert_eq!(config.accept, "plan,apply");
 
         unsafe {
-            std::env::set_var("TERRENCE_AGENT_ACCEPT", "plan,apply,destroy");
+            std::env::set_var("TERRENCE_AGENT_ACCEPT", "apply, plan");
         }
         let config = Config::from_env().unwrap();
-        assert_eq!(config.accept, "plan,apply,destroy");
+        assert_eq!(config.accept, "apply,plan");
+        unsafe {
+            std::env::set_var("TERRENCE_AGENT_ACCEPT", "plan,apply,destroy");
+        }
+        assert!(Config::from_env().is_err());
         unsafe {
             std::env::remove_var("TERRENCE_AGENT_ACCEPT");
             std::env::remove_var("TERRENCE_AGENT_TOKEN");
         }
+    }
+
+    #[test]
+    fn accepts_none_and_bounds_parallelism() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TERRENCE_AGENT_TOKEN", "tok");
+            std::env::set_var("TERRENCE_AGENT_ACCEPT", "none");
+            std::env::set_var("TERRENCE_AGENT_MAX_PARALLELISM", "999999");
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.accept, "none");
+        assert_eq!(config.max_parallelism, HARD_MAX_PARALLELISM as u32);
+        unsafe {
+            std::env::set_var("TERRENCE_AGENT_MAX_PARALLELISM", "0");
+        }
+        assert!(Config::from_env().is_err());
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_ACCEPT");
+            std::env::remove_var("TERRENCE_AGENT_MAX_PARALLELISM");
+            std::env::remove_var("TERRENCE_AGENT_TOKEN");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_accept_tokens() {
+        assert!(parse_accept("plan,,apply".to_owned()).is_err());
+        assert!(parse_accept("".to_owned()).is_err());
+        assert_eq!(
+            parse_accept(" PLAN, apply ".to_owned()).unwrap(),
+            "plan,apply"
+        );
     }
 
     #[test]

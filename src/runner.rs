@@ -289,7 +289,18 @@ impl Runner {
                     plan_args.push("-refresh-only".to_owned());
                 }
                 if let Some(parallelism) = container.parallelism {
-                    plan_args.push(format!("-parallelism={parallelism}"));
+                    if parallelism == 0 {
+                        bail!("parallelism must be greater than zero");
+                    }
+                    let bounded = parallelism.min(self.config.max_parallelism);
+                    if bounded != parallelism {
+                        warn!(
+                            requested = parallelism,
+                            maximum = self.config.max_parallelism,
+                            "clamping Terraform parallelism to agent maximum"
+                        );
+                    }
+                    plan_args.push(format!("-parallelism={bounded}"));
                 }
                 for target in &container.target_addrs {
                     plan_args.push(format!("-target={target}"));
@@ -1206,6 +1217,7 @@ mod tests {
             log_level: "info".to_owned(),
             log_json: false,
             accept: "plan,apply".to_owned(),
+            max_parallelism: 64,
             terraform_path: None,
             tofu_path: None,
             landlock_runner: None,

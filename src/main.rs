@@ -17,6 +17,7 @@ use client::{Client, ClientError};
 use config::Config;
 use protocol::{AgentJobPayload, CompletionJob};
 use runner::Runner;
+use tokio::sync::Notify;
 use tokio::time;
 use tracing::{error, info, warn};
 
@@ -48,7 +49,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    register_with_retry(&client).await?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_notify = Arc::new(Notify::new());
+    let signal_shutdown = Arc::clone(&shutdown);
+    let signal_notify = Arc::clone(&shutdown_notify);
+    tokio::spawn(async move {
+        wait_for_shutdown(signal_shutdown, signal_notify).await;
+    });
+
+    if !register_with_retry(&client, &shutdown, &shutdown_notify).await? {
+        info!("shutdown requested before registration completed");
+        return Ok(());
+    }
     info!(
         display_name = %config.display_name,
         hostname = %config.hostname,
@@ -58,37 +70,51 @@ async fn main() -> Result<()> {
         "terrence-agent started"
     );
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let force_exit = Arc::new(AtomicBool::new(false));
-    let signal_shutdown = Arc::clone(&shutdown);
-    let signal_force = Arc::clone(&force_exit);
-    tokio::spawn(async move {
-        wait_for_shutdown(signal_shutdown, signal_force).await;
-    });
-
+    let mut idle_round = 0u32;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-        let completed_single_job = match poll_once(&client, &runner, &config).await {
-            Ok(completed_single_job) => completed_single_job,
-            Err(error) => {
-                if matches!(
-                    error.downcast_ref::<ClientError>(),
-                    Some(ClientError::Auth(_))
-                ) {
-                    warn!(error = %error, "agent authentication failed; re-registering");
-                    register_with_retry(&client).await?;
-                } else {
-                    warn!(error = %error, "agent check-in failed");
+        let poll_result =
+            match poll_once(&client, &runner, &config, &shutdown, &shutdown_notify).await {
+                Ok(poll_result) => poll_result,
+                Err(error) => {
+                    if matches!(
+                        error.downcast_ref::<ClientError>(),
+                        Some(ClientError::Auth(_))
+                    ) {
+                        warn!(error = %error, "agent authentication failed; re-registering");
+                        if !register_with_retry(&client, &shutdown, &shutdown_notify).await? {
+                            break;
+                        }
+                    } else {
+                        warn!(error = %error, "agent check-in failed");
+                    }
+                    PollResult::Idle
                 }
-                false
+            };
+        let delay = match poll_result {
+            PollResult::Shutdown => break,
+            PollResult::Job { single } => {
+                idle_round = 0;
+                if single {
+                    break;
+                }
+                idle_backoff(config.check_interval, idle_round)
+            }
+            PollResult::Idle => {
+                let delay = idle_backoff(config.check_interval, idle_round);
+                idle_round = idle_round.saturating_add(1);
+                delay
+            }
+            PollResult::RetryAfter(delay) => {
+                idle_round = 0;
+                delay
             }
         };
-        if completed_single_job || shutdown.load(Ordering::SeqCst) {
+        if !sleep_until(delay, &shutdown, &shutdown_notify).await {
             break;
         }
-        time::sleep(splayed(config.check_interval)).await;
     }
 
     // Graceful shutdown: deregister so the server can reclaim the agent slot.
@@ -106,7 +132,7 @@ async fn main() -> Result<()> {
 /// signal forces an immediate exit, mirroring upstream behavior under a tight
 /// shutdown deadline.
 #[cfg(unix)]
-async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, _force_exit: Arc<AtomicBool>) {
+async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, notify: Arc<Notify>) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
@@ -122,44 +148,82 @@ async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, _force_exit: Arc<AtomicBoo
             first = false;
             info!("shutdown signal received; finishing the current job before exiting");
             shutdown.store(true, Ordering::SeqCst);
+            notify.notify_one();
         } else {
             warn!("second termination signal received; forcing immediate exit");
-            std::process::exit(0);
+            std::process::exit(1);
         }
     }
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, _force_exit: Arc<AtomicBool>) {
+async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, notify: Arc<Notify>) {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown signal received; finishing the current job before exiting");
     shutdown.store(true, Ordering::SeqCst);
+    notify.notify_one();
 }
 
-async fn register_with_retry(client: &Client) -> Result<()> {
+async fn register_with_retry(
+    client: &Client,
+    shutdown: &Arc<AtomicBool>,
+    notify: &Arc<Notify>,
+) -> Result<bool> {
     let mut delay = Duration::from_secs(1);
     loop {
-        match client.register().await {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let result = tokio::select! {
+            result = client.register() => result,
+            _ = notify.notified() => return Ok(false),
+        };
+        match result {
             Ok(agent_id) => {
                 info!(agent_id = %agent_id, "registered with Terrence");
-                return Ok(());
+                return Ok(true);
             }
             Err(ClientError::Auth(error)) => {
                 anyhow::bail!("agent registration rejected: {error}");
             }
             Err(error) => {
                 warn!(error = %error, retry_seconds = delay.as_secs(), "agent registration failed");
-                time::sleep(delay).await;
+                if !sleep_until(delay, shutdown, notify).await {
+                    return Ok(false);
+                }
                 delay = (delay * 2).min(Duration::from_secs(30));
             }
         }
     }
 }
 
-async fn poll_once(client: &Client, runner: &Runner, config: &Config) -> Result<bool> {
-    let payload = match client.claim().await? {
-        Some(payload) => payload,
-        None => return Ok(false),
+#[derive(Debug, Eq, PartialEq)]
+enum PollResult {
+    Idle,
+    Job { single: bool },
+    RetryAfter(Duration),
+    Shutdown,
+}
+
+async fn poll_once(
+    client: &Client,
+    runner: &Runner,
+    config: &Config,
+    shutdown: &Arc<AtomicBool>,
+    notify: &Arc<Notify>,
+) -> Result<PollResult> {
+    if shutdown.load(Ordering::SeqCst) {
+        return Ok(PollResult::Shutdown);
+    }
+    let claim = tokio::select! {
+        result = client.claim() => result,
+        _ = notify.notified() => return Ok(PollResult::Shutdown),
+    };
+    let payload = match claim {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return Ok(PollResult::Idle),
+        Err(ClientError::RetryAfter { delay, .. }) => return Ok(PollResult::RetryAfter(delay)),
+        Err(error) => return Err(error.into()),
     };
     info!(
         phase = payload.phase.as_str(),
@@ -176,9 +240,9 @@ async fn poll_once(client: &Client, runner: &Runner, config: &Config) -> Result<
     report_completion(client, &payload, outcome.completion).await?;
     if config.single {
         info!("single-job mode complete");
-        return Ok(true);
+        return Ok(PollResult::Job { single: true });
     }
-    Ok(false)
+    Ok(PollResult::Job { single: false })
 }
 
 async fn report_completion(
@@ -195,6 +259,22 @@ async fn report_completion(
             error!(phase = payload.phase.as_str(), run_id = %payload.data.run_id, error = %error, "failed to report job completion");
             Err(error.into())
         }
+    }
+}
+
+fn idle_backoff(base: Duration, idle_round: u32) -> Duration {
+    let multiplier = 1u32 << idle_round.min(6);
+    let delay = base.saturating_mul(multiplier).min(Duration::from_secs(60));
+    splayed(delay).min(Duration::from_secs(60))
+}
+
+async fn sleep_until(delay: Duration, shutdown: &Arc<AtomicBool>, notify: &Arc<Notify>) -> bool {
+    if shutdown.load(Ordering::SeqCst) {
+        return false;
+    }
+    tokio::select! {
+        _ = time::sleep(delay) => true,
+        _ = notify.notified() => false,
     }
 }
 

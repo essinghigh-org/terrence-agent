@@ -2,6 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::{RequestBuilder, StatusCode, header};
@@ -43,6 +44,8 @@ pub enum ClientError {
     },
     #[error("response from {path} exceeded the {limit} byte limit")]
     ResponseTooLarge { path: String, limit: usize },
+    #[error("Terrence asked the agent to retry {path} after {delay:?}")]
+    RetryAfter { path: String, delay: Duration },
 }
 
 #[derive(Clone)]
@@ -82,7 +85,13 @@ impl Client {
             session_id: self.config.session_id.clone(),
             arch: architecture().to_owned(),
             os: operating_system().to_owned(),
-            iac_binaries: vec!["terraform".to_owned(), "tofu".to_owned()],
+            iac_binaries: self
+                .config
+                .iac_binaries()
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            accept: self.config.accept.clone(),
         };
         let request = self
             .http
@@ -129,18 +138,38 @@ impl Client {
 
     pub async fn deregister(&self) -> Result<(), ClientError> {
         // Best-effort: a graceful shutdown requests deregistration so the
-        // server can free the agent slot. Failures are logged by the caller.
-        let request = self
-            .http
-            .delete(self.api_url("/api/agent/register"))
-            .headers(self.agent_headers().await?);
-        match request.send().await {
-            Ok(_) => Ok(()),
-            Err(source) => Err(ClientError::Network {
-                path: "/api/agent/register".to_owned(),
-                source,
-            }),
+        // server can free the agent slot. Retry transient failures, but never
+        // report an HTTP error as a successful deregistration.
+        let path = "/api/agent/register";
+        let mut delay = Duration::from_millis(100);
+        for attempt in 0..3 {
+            let request = self
+                .http
+                .delete(self.api_url(path))
+                .headers(self.agent_headers().await?);
+            match request.send().await {
+                Ok(response) if response.status().is_success() => return Ok(()),
+                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                    return Err(ClientError::Auth(path.to_owned()));
+                }
+                Ok(response) if response.status().is_server_error() && attempt < 2 => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Ok(response) => return Err(self.http_error(response, path).await),
+                Err(_source) if attempt < 2 => {
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(source) => {
+                    return Err(ClientError::Network {
+                        path: path.to_owned(),
+                        source,
+                    });
+                }
+            }
         }
+        unreachable!("deregistration retry loop always returns")
     }
 
     pub async fn claim(&self) -> Result<Option<AgentJobPayload>, ClientError> {
@@ -157,12 +186,33 @@ impl Client {
                 source,
             })?;
         if response.status() == StatusCode::NO_CONTENT {
+            if let Some(delay) = retry_after(&response) {
+                return Err(ClientError::RetryAfter {
+                    path: "/api/agent/jobs".to_owned(),
+                    delay,
+                });
+            }
             return Ok(None);
         }
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(ClientError::Auth("/api/agent/jobs".to_owned()));
         }
         if !response.status().is_success() {
+            if let Some(delay) = retry_after(&response).filter(|_| {
+                response.status() == StatusCode::TOO_MANY_REQUESTS
+                    || response.status().is_server_error()
+            }) {
+                return Err(ClientError::RetryAfter {
+                    path: "/api/agent/jobs".to_owned(),
+                    delay,
+                });
+            }
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                return Err(ClientError::RetryAfter {
+                    path: "/api/agent/jobs".to_owned(),
+                    delay: Duration::from_secs(1),
+                });
+            }
             return Err(self.http_error(response, "/api/agent/jobs").await);
         }
         let bytes = limited_bytes(response, "/api/agent/jobs", MAX_JOB_PAYLOAD_BYTES).await?;
@@ -410,6 +460,17 @@ fn url_label(value: &str) -> String {
         .unwrap_or_else(|_| value.to_owned())
 }
 
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let seconds = response
+        .headers()
+        .get(header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds.min(300)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +500,7 @@ mod tests {
             log_level: "info".to_owned(),
             log_json: false,
             accept: "plan,apply".to_owned(),
+            max_parallelism: 64,
             terraform_path: None,
             tofu_path: None,
             landlock_runner: None,
@@ -584,5 +646,30 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_honors_retry_after_for_rate_limits() {
+        let server = MockServer::start().await;
+        let client = Client::new(config(server.uri())).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/agent/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "agent-test",
+                "agent_pool_id": "pool-test"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agent/jobs"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "7"))
+            .mount(&server)
+            .await;
+
+        client.register().await.unwrap();
+        assert!(matches!(
+            client.claim().await,
+            Err(ClientError::RetryAfter { delay, .. }) if delay == Duration::from_secs(7)
+        ));
     }
 }

@@ -102,6 +102,7 @@ impl<'de> Deserialize<'de> for ValidatedId {
 #[derive(Clone, Debug, Deserialize)]
 pub struct RegisterResponse {
     pub id: AgentId,
+    #[allow(dead_code)]
     pub agent_pool_id: AgentPoolId,
     #[serde(default)]
     pub session_token: Option<String>,
