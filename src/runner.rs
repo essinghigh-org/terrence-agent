@@ -973,15 +973,42 @@ impl Runner {
                     .await;
                 let state_capture = match state_capture {
                     Ok(capture) => capture,
-                    Err(error) if error.downcast_ref::<JobCanceled>().is_some() => {
-                        return Err(error);
+                    Err(error) => {
+                        if let Some(canceled) = error.downcast_ref::<JobCanceled>() {
+                            let state = if canceled.reason == CancelReason::ForceShutdown {
+                                None
+                            } else {
+                                let recovery_control = ExecutionControl {
+                                    remote: CancellationToken::new(),
+                                    shutdown: CancellationToken::new(),
+                                    force_shutdown: CancellationToken::new(),
+                                };
+                                self.capture_json(
+                                    binary,
+                                    &["state", "pull"],
+                                    exec_dir,
+                                    work_dir,
+                                    environment,
+                                    JobDeadline {
+                                        deadline: Instant::now() + CANCEL_STATE_TIMEOUT,
+                                    },
+                                    &recovery_control,
+                                )
+                                .await
+                                .ok()
+                            };
+                            return Err(anyhow::Error::new(JobCanceled {
+                                reason: canceled.reason,
+                                state,
+                            }));
+                        }
+                        StateCapture {
+                            command_error: Some(format_error(&error)),
+                            bytes: fs::metadata(&state_path)
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0),
+                        }
                     }
-                    Err(error) => StateCapture {
-                        command_error: Some(format_error(&error)),
-                        bytes: fs::metadata(&state_path)
-                            .map(|metadata| metadata.len())
-                            .unwrap_or(0),
-                    },
                 };
                 let state_recovered =
                     state_capture.bytes > 0 && validate_state_file(&state_path).is_ok();
