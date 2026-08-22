@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod journal;
 mod manifest;
+mod observability;
 mod protocol;
 mod provider_cache;
 mod runner;
@@ -21,6 +22,7 @@ use client::{Client, ClientError};
 use config::Config;
 use journal::{Journal, JournalEntry, JournalState};
 use manifest::ExecutionManifest;
+use observability::Metrics;
 use protocol::CompletionJob;
 use runner::Runner;
 use tokio::sync::Notify;
@@ -44,14 +46,19 @@ async fn main() -> Result<()> {
     let journal = Journal::open(&config.data_dir)?;
 
     let client = Client::new(config.clone())?;
-    let runner = Runner::new(client.clone());
+    let metrics = Metrics::new();
+    let _health_server = observability::start_health_server(metrics.clone()).await?;
+    let runner = Runner::with_metrics(client.clone(), metrics.clone());
     if config.sandbox {
         let sandbox = sandbox::Sandbox::new(&config);
         if !sandbox.enabled() {
             anyhow::bail!("Landlock sandbox is enabled but landlock-runner is not installed");
         }
         match sandbox.probe() {
-            Ok(Some(abi)) => info!(landlock_abi = %abi, "Landlock sandbox available"),
+            Ok(Some(abi)) => {
+                metrics.set_sandbox_abi(Some(&abi)).await;
+                info!(landlock_abi = %abi, "Landlock sandbox available");
+            }
             Ok(None) => {
                 anyhow::bail!("Landlock sandbox is enabled but landlock-runner is not installed")
             }
@@ -67,7 +74,7 @@ async fn main() -> Result<()> {
         wait_for_shutdown(signal_shutdown, signal_notify).await;
     });
 
-    if !register_with_retry(&client, &shutdown, &shutdown_notify).await? {
+    if !register_with_retry(&client, &metrics, &shutdown, &shutdown_notify).await? {
         info!("shutdown requested before registration completed");
         return Ok(());
     }
@@ -76,7 +83,7 @@ async fn main() -> Result<()> {
         hostname = %config.hostname,
         instance_id = %config.instance_id,
         session_id = %config.session_id,
-        address = %config.address,
+        address = %observability::safe_endpoint_host(&config.address),
         "terrence-agent started"
     );
 
@@ -90,6 +97,7 @@ async fn main() -> Result<()> {
             &runner,
             &journal,
             &config,
+            &metrics,
             &shutdown,
             &shutdown_notify,
         )
@@ -102,7 +110,7 @@ async fn main() -> Result<()> {
                     Some(ClientError::Auth(_))
                 ) {
                     warn!(error = %error, "agent authentication failed; re-registering");
-                    if !register_with_retry(&client, &shutdown, &shutdown_notify).await? {
+                    if !register_with_retry(&client, &metrics, &shutdown, &shutdown_notify).await? {
                         break;
                     }
                 } else {
@@ -184,6 +192,7 @@ async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, notify: Arc<Notify>) {
 
 async fn register_with_retry(
     client: &Client,
+    metrics: &Metrics,
     shutdown: &Arc<AtomicBool>,
     notify: &Arc<Notify>,
 ) -> Result<bool> {
@@ -198,13 +207,16 @@ async fn register_with_retry(
         };
         match result {
             Ok(agent_id) => {
+                metrics.registration_succeeded();
                 info!(agent_id = %agent_id, "registered with Terrence");
                 return Ok(true);
             }
             Err(ClientError::Auth(error)) => {
+                metrics.registration_failed();
                 anyhow::bail!("agent registration rejected: {error}");
             }
             Err(error) => {
+                metrics.registration_failed();
                 warn!(error = %error, retry_seconds = delay.as_secs(), "agent registration failed");
                 if !sleep_until(delay, shutdown, notify).await {
                     return Ok(false);
@@ -228,14 +240,16 @@ async fn poll_once(
     runner: &Runner,
     journal: &Journal,
     config: &Config,
+    metrics: &Metrics,
     shutdown: &Arc<AtomicBool>,
     notify: &Arc<Notify>,
 ) -> Result<PollResult> {
     if shutdown.load(Ordering::SeqCst) {
         return Ok(PollResult::Shutdown);
     }
+    metrics.poll_started();
     if let Some(entry) = journal.unfinished()?.into_iter().next() {
-        finish_journal_entry(client, runner, journal, entry).await?;
+        finish_journal_entry(client, runner, journal, entry, metrics).await?;
         return Ok(PollResult::Idle);
     }
     let claim = tokio::select! {
@@ -246,8 +260,14 @@ async fn poll_once(
         Ok(Some(payload)) => payload,
         Ok(None) => return Ok(PollResult::Idle),
         Err(ClientError::RetryAfter { delay, .. }) => return Ok(PollResult::RetryAfter(delay)),
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            metrics.poll_failed();
+            return Err(error.into());
+        }
     };
+    metrics
+        .job_claimed(&payload.data.run_id, payload.phase.as_str())
+        .await;
     info!(
         phase = payload.phase.as_str(),
         job_id = %payload.job_id,
@@ -259,7 +279,7 @@ async fn poll_once(
     let manifest = ExecutionManifest::from_payload(&payload)?;
     let journal_entry = journal.start(manifest)?;
     if journal_entry.state != JournalState::Claimed {
-        finish_journal_entry(client, runner, journal, journal_entry).await?;
+        finish_journal_entry(client, runner, journal, journal_entry, metrics).await?;
         return Ok(PollResult::Idle);
     }
     let journal_entry = journal.mark_executing(&journal_entry)?;
@@ -267,9 +287,17 @@ async fn poll_once(
         warn!(error = %error, "failed to report busy status");
     }
     let outcome = runner.run(&payload).await;
+    let completion_status = outcome.completion.status;
     let journal_entry =
         journal.record_completion(&journal_entry, &outcome.completion, outcome.work_dir)?;
-    finish_journal_entry(client, runner, journal, journal_entry).await?;
+    metrics.timeline(
+        "completion.sent",
+        Some(&payload.data.run_id),
+        Some(payload.phase.as_str()),
+    );
+    finish_journal_entry(client, runner, journal, journal_entry, metrics).await?;
+    metrics.job_finished(completion_status == "finished");
+    metrics.clear_job().await;
     if config.single {
         info!("single-job mode complete");
         return Ok(PollResult::Job { single: true });
@@ -282,9 +310,14 @@ async fn report_completion_details(
     phase: &str,
     run_id: &str,
     completion: CompletionJob,
+    metrics: &Metrics,
 ) -> Result<()> {
     match client.put_status("idle", Some(&completion)).await {
         Ok(()) => {
+            metrics.timeline("completion.acked", Some(run_id), Some(phase));
+            if completion.data.state.is_some() {
+                metrics.timeline("state.uploaded", Some(run_id), Some(phase));
+            }
             info!(
                 phase,
                 run_id,
@@ -305,6 +338,7 @@ async fn finish_journal_entry(
     runner: &Runner,
     journal: &Journal,
     entry: JournalEntry,
+    metrics: &Metrics,
 ) -> Result<()> {
     let entry = match entry.state {
         JournalState::CompletionPending => {
@@ -317,6 +351,7 @@ async fn finish_journal_entry(
                 &entry.manifest.phase,
                 &entry.manifest.run_id,
                 completion,
+                metrics,
             )
             .await?;
             journal.mark_completion_acked(&entry)?

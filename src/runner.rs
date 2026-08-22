@@ -17,6 +17,7 @@ use crate::archive::{extract_tar_gz, flatten_single_directory, pack_tar_gz};
 use crate::client::Client;
 use crate::config::Config;
 use crate::manifest::ExecutionManifest;
+use crate::observability::Metrics;
 use crate::protocol::{
     AgentJobPayload, CompletionData, CompletionJob, JobContainer, JobData, Phase, PlanCounts,
     state_outputs,
@@ -35,6 +36,7 @@ pub struct Runner {
     config: Config,
     sandbox: Sandbox,
     toolchain: ToolchainResolver,
+    metrics: Metrics,
 }
 
 pub struct JobOutcome {
@@ -73,7 +75,12 @@ impl PlanMetadata {
 }
 
 impl Runner {
+    #[allow(dead_code)]
     pub fn new(client: Client) -> Self {
+        Self::with_metrics(client, Metrics::new())
+    }
+
+    pub fn with_metrics(client: Client, metrics: Metrics) -> Self {
         let config = client.config().clone();
         let sandbox = Sandbox::new(&config);
         let toolchain = ToolchainResolver::new(config.cache_dir.clone());
@@ -82,6 +89,7 @@ impl Runner {
             config,
             sandbox,
             toolchain,
+            metrics,
         }
     }
 
@@ -135,7 +143,15 @@ impl Runner {
         let Some(path) = manifest.work_dir.as_deref() else {
             return Ok(());
         };
-        RunDirectory::cleanup_path(&self.config.data_dir, path).await
+        let result = RunDirectory::cleanup_path(&self.config.data_dir, path).await;
+        if result.is_ok() {
+            self.metrics.timeline(
+                "cleanup.finished",
+                Some(&manifest.run_id),
+                Some(&manifest.phase),
+            );
+        }
+        result
     }
 
     async fn run_inner(&self, payload: &AgentJobPayload, work_dir: &Path) -> Result<RunResult> {
@@ -146,6 +162,13 @@ impl Runner {
         set_private_permissions(&work_dir.join("tmp"))?;
 
         let exec_dir = working_directory(work_dir, &payload.data.working_directory)?;
+        self.metrics
+            .stage_event(
+                "configuration.download.started",
+                &payload.data.run_id,
+                payload.phase.as_str(),
+            )
+            .await;
         match payload.phase {
             Phase::Plan => {
                 self.prepare_plan(payload, container, work_dir, &exec_dir)
@@ -156,6 +179,13 @@ impl Runner {
                     .await?
             }
         }
+        self.metrics
+            .stage_event(
+                "configuration.download.finished",
+                &payload.data.run_id,
+                payload.phase.as_str(),
+            )
+            .await;
         fs::create_dir_all(&exec_dir)?;
 
         let binary_name = match payload.data.iac_binary.as_deref().unwrap_or("terraform") {
@@ -166,7 +196,20 @@ impl Runner {
         let binary = self
             .resolve_binary(binary_name, &payload.data, container)
             .await?;
-        let environment = execution_environment(payload, container, work_dir, self.config.sandbox)?;
+        self.metrics
+            .stage_event("tool.resolve", &payload.data.run_id, payload.phase.as_str())
+            .await;
+        if self.config.sandbox {
+            self.metrics
+                .stage_event(
+                    "sandbox.created",
+                    &payload.data.run_id,
+                    payload.phase.as_str(),
+                )
+                .await;
+        }
+        let environment =
+            execution_environment(payload, container, work_dir, self.config.sandbox)?;
         let log_stream =
             LogStream::new(self.client.clone(), payload.data.terraform_log_url.clone());
         let heartbeat = self.start_heartbeat();
@@ -191,13 +234,18 @@ impl Runner {
 
     fn start_heartbeat(&self) -> JoinHandle<()> {
         let client = self.client.clone();
+        let metrics = self.metrics.clone();
         tokio::spawn(async move {
             let mut interval = time::interval(HEARTBEAT_INTERVAL);
             interval.tick().await;
             loop {
                 interval.tick().await;
-                if let Err(error) = client.put_status("busy", None).await {
-                    warn!(error = %error, "agent heartbeat failed");
+                match client.put_status("busy", None).await {
+                    Ok(()) => metrics.heartbeat_succeeded().await,
+                    Err(error) => {
+                        metrics.heartbeat_failed();
+                        warn!(error = %error, "agent heartbeat failed");
+                    }
                 }
             }
         })
@@ -267,6 +315,9 @@ impl Runner {
                     "-no-color".to_owned(),
                     "-input=false".to_owned(),
                 ];
+                self.metrics
+                    .stage_event("init.started", &payload.data.run_id, payload.phase.as_str())
+                    .await;
                 let init_status = self
                     .run_streamed(
                         binary,
@@ -282,6 +333,13 @@ impl Runner {
                 if !init_status {
                     bail!("terraform init failed");
                 }
+                self.metrics
+                    .stage_event(
+                        "init.finished",
+                        &payload.data.run_id,
+                        payload.phase.as_str(),
+                    )
+                    .await;
 
                 let mut plan_args = vec![
                     "plan".to_owned(),
@@ -314,6 +372,9 @@ impl Runner {
                 for replace in &container.replace_addrs {
                     plan_args.push(format!("-replace={replace}"));
                 }
+                self.metrics
+                    .stage_event("plan.started", &payload.data.run_id, payload.phase.as_str())
+                    .await;
                 let plan_status = self
                     .run_streamed(
                         binary,
@@ -329,6 +390,13 @@ impl Runner {
                 if !plan_status {
                     bail!("terraform plan failed");
                 }
+                self.metrics
+                    .stage_event(
+                        "plan.finished",
+                        &payload.data.run_id,
+                        payload.phase.as_str(),
+                    )
+                    .await;
 
                 let plan_json = self
                     .capture_json(
@@ -350,6 +418,13 @@ impl Runner {
                     )
                     .await
                     .context("upload plan JSON")?;
+                self.metrics
+                    .stage_event(
+                        "plan_json.uploaded",
+                        &payload.data.run_id,
+                        payload.phase.as_str(),
+                    )
+                    .await;
 
                 match self
                     .capture_json(
@@ -384,6 +459,13 @@ impl Runner {
                     .put_artifact(&payload.data.filesystem_url, snapshot, "application/gzip")
                     .await
                     .context("upload plan filesystem snapshot")?;
+                self.metrics
+                    .stage_event(
+                        "snapshot.uploaded",
+                        &payload.data.run_id,
+                        payload.phase.as_str(),
+                    )
+                    .await;
                 Ok(RunResult {
                     counts,
                     state: None,
@@ -405,6 +487,13 @@ impl Runner {
                     "-input=false".to_owned(),
                     "tfplan".to_owned(),
                 ];
+                self.metrics
+                    .stage_event(
+                        "apply.started",
+                        &payload.data.run_id,
+                        payload.phase.as_str(),
+                    )
+                    .await;
                 let apply_status = self
                     .run_streamed(
                         binary,
@@ -420,6 +509,13 @@ impl Runner {
                 if !apply_status {
                     bail!("terraform apply failed");
                 }
+                self.metrics
+                    .stage_event(
+                        "apply.execution_finished",
+                        &payload.data.run_id,
+                        payload.phase.as_str(),
+                    )
+                    .await;
                 let state = match self
                     .capture_json(
                         binary,
@@ -431,7 +527,16 @@ impl Runner {
                     )
                     .await
                 {
-                    Ok(state) => Some(state),
+                    Ok(state) => {
+                        self.metrics
+                            .stage_event(
+                                "state.recovered",
+                                &payload.data.run_id,
+                                payload.phase.as_str(),
+                            )
+                            .await;
+                        Some(state)
+                    }
                     Err(error) => {
                         warn!(error = %error, "terraform state pull failed after apply");
                         None

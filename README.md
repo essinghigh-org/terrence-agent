@@ -46,6 +46,7 @@ for an unsupported IaC binary.
 | `TERRENCE_AGENT_CHECK_INTERVAL_MS` | `2000` | Empty-pool polling floor |
 | `TERRENCE_AGENT_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, or `error` |
 | `TERRENCE_AGENT_LOG_JSON` | `false` | Emit structured JSON logs |
+| `TERRENCE_AGENT_HEALTH_ADDRESS` | unset | Optional loopback `host:port` for `/live`, `/ready`, `/metrics`, and `/doctor` |
 | `TERRENCE_AGENT_TERRAFORM` | PATH lookup | Explicit Terraform binary |
 | `TERRENCE_AGENT_TOFU` | PATH lookup | Explicit OpenTofu binary |
 | `TERRENCE_LANDLOCK_RUNNER` | image helper | Explicit Landlock helper |
