@@ -46,6 +46,7 @@ for an unsupported IaC binary.
 | `TERRENCE_AGENT_CACHE_DIR` | `<data_dir>/cache` | IaC binary cache (separate from run data) |
 | `TERRENCE_AGENT_SINGLE` | `false` | Claim one job and exit |
 | `TERRENCE_AGENT_SANDBOX` | `true` | Require Landlock for IaC commands |
+| `TERRENCE_AGENT_SANDBOX_PROFILE` | `compatibility` | `strict`, `provisioner`, or compatibility profile |
 | `TERRENCE_AGENT_CHECK_INTERVAL_MS` | `2000` | Empty-pool polling floor |
 | `TERRENCE_AGENT_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, or `error` |
 | `TERRENCE_AGENT_LOG_JSON` | `false` | Emit structured JSON logs |
@@ -71,6 +72,14 @@ permissions and should live on encrypted storage. Prefer an ephemeral volume
 for short-lived agents so plans, state, and credentials disappear with the
 agent. Set `TERRENCE_AGENT_ALLOW_INSECURE_DIRS=true` only for an isolated host
 where shared storage is intentional.
+
+The compatibility sandbox profile is the upgrade-safe default: it requires only
+Landlock ABI 1 and keeps common provider paths readable. Set
+`TERRENCE_AGENT_SANDBOX_PROFILE=strict` for the narrowest filesystem policy, or
+`provisioner` when provider installation needs its broader write paths.
+
+The local `/doctor` endpoint is a non-failing health snapshot; use the
+`terrence-agent doctor` CLI command for the full diagnostic checks.
 
 ## Diagnostics
 

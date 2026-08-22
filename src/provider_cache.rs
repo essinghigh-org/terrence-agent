@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, bail};
 use walkdir::WalkDir;
@@ -43,8 +44,23 @@ impl ProviderCache {
         if value.is_empty() {
             bail!("{AGENT_PLUGIN_CACHE_DIR} cannot be empty");
         }
-        let cache = Self::from_path(PathBuf::from(value))?;
+        let path = PathBuf::from(value);
+        static VERIFIED: OnceLock<Mutex<HashMap<PathBuf, ProviderCache>>> = OnceLock::new();
+        let verified = VERIFIED.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(cache) = verified
+            .lock()
+            .map_err(|_| anyhow::anyhow!("provider cache verification lock is poisoned"))?
+            .get(&path)
+            .cloned()
+        {
+            return Ok(Some(cache));
+        }
+        let cache = Self::from_path(path.clone())?;
         cache.verify()?;
+        verified
+            .lock()
+            .map_err(|_| anyhow::anyhow!("provider cache verification lock is poisoned"))?
+            .insert(path, cache.clone());
         Ok(Some(cache))
     }
 

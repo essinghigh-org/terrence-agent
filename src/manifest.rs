@@ -40,12 +40,35 @@ impl ExecutionManifest {
 }
 
 pub fn payload_fingerprint(payload: &AgentJobPayload) -> Result<String> {
-    let value = serde_json::to_value(payload).context("serialize job payload for fingerprint")?;
+    let mut value =
+        serde_json::to_value(payload).context("serialize job payload for fingerprint")?;
+    strip_rotating_fields(&mut value);
     let mut canonical = Vec::new();
     write_canonical(&value, &mut canonical).context("canonicalize job payload")?;
     let mut hasher = Sha256::new();
     hasher.update(canonical);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn strip_rotating_fields(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(strip_rotating_fields),
+        Value::Object(values) => {
+            for key in [
+                "token",
+                "configuration_version_url",
+                "filesystem_url",
+                "terraform_url",
+                "terraform_log_url",
+                "json_plan_url",
+                "state_artifact_url",
+            ] {
+                values.remove(key);
+            }
+            values.values_mut().for_each(strip_rotating_fields);
+        }
+        _ => {}
+    }
 }
 
 fn write_canonical(value: &Value, output: &mut Vec<u8>) -> std::io::Result<()> {
@@ -150,6 +173,23 @@ mod tests {
         write_canonical(&serde_json::json!({"a": null}), &mut with_null).unwrap();
         write_canonical(&serde_json::json!({}), &mut without_null).unwrap();
         assert_eq!(with_null, without_null);
+    }
+
+    #[test]
+    fn fingerprint_ignores_rotating_credentials_and_urls() {
+        let mut first = payload(HashMap::new());
+        let mut second = first.clone();
+        second.data.token = "rotated-token".to_owned();
+        second.data.configuration_version_url = "/configuration?signature=rotated".to_owned();
+        assert_eq!(
+            payload_fingerprint(&first).unwrap(),
+            payload_fingerprint(&second).unwrap()
+        );
+        first.data.working_directory = "different".to_owned();
+        assert_ne!(
+            payload_fingerprint(&first).unwrap(),
+            payload_fingerprint(&second).unwrap()
+        );
     }
 
     #[test]

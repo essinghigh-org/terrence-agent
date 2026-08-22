@@ -25,9 +25,8 @@ use config::{Config, request_forwarding_enabled};
 use journal::{Journal, JournalEntry, JournalState};
 use manifest::ExecutionManifest;
 use observability::Metrics;
-use protocol::CompletionJob;
+use protocol::{CompletionData, CompletionJob};
 use runner::Runner;
-use tokio::sync::Notify;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -48,6 +47,7 @@ async fn main() -> Result<()> {
     config::ensure_private_dir(&config.data_dir, "data directory")?;
     config::ensure_private_dir(&config.data_dir.join("runs"), "runs directory")?;
     config::ensure_private_dir(&config.cache_dir, "cache directory")?;
+    logs::cleanup_stale_spools(&config.data_dir.join("log-spool"))?;
     let journal = Journal::open(&config.data_dir)?;
 
     let client = Client::new(config.clone())?;
@@ -71,26 +71,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown = runner.shutdown_token();
     let force_exit = Arc::new(AtomicBool::new(false));
-    let shutdown_notify = Arc::new(Notify::new());
-    let signal_shutdown = Arc::clone(&shutdown);
+    let signal_shutdown = shutdown.clone();
     let signal_force_exit = Arc::clone(&force_exit);
-    let signal_notify = Arc::clone(&shutdown_notify);
-    let runner_shutdown = runner.shutdown_token();
     let runner_force_shutdown = runner.force_shutdown_token();
     tokio::spawn(async move {
-        wait_for_shutdown(
-            signal_shutdown,
-            signal_force_exit,
-            signal_notify,
-            runner_shutdown,
-            runner_force_shutdown,
-        )
-        .await;
+        wait_for_shutdown(signal_shutdown, signal_force_exit, runner_force_shutdown).await;
     });
 
-    if !register_with_retry(&client, &metrics, &shutdown, &shutdown_notify).await? {
+    if !register_with_retry(&client, &metrics, &shutdown).await? {
         info!("shutdown requested before registration completed");
         if force_exit.load(Ordering::SeqCst) {
             bail!("forced shutdown requested");
@@ -108,7 +98,7 @@ async fn main() -> Result<()> {
 
     let forwarding_task = if request_forwarding_enabled() && !config.single {
         let forwarding_client = client.clone();
-        let forwarding_shutdown = Arc::clone(&shutdown);
+        let forwarding_shutdown = shutdown.clone();
         let forwarding_interval = config.check_interval;
         Some(tokio::spawn(async move {
             forwarding_loop(forwarding_client, forwarding_shutdown, forwarding_interval).await;
@@ -119,36 +109,27 @@ async fn main() -> Result<()> {
 
     let mut idle_round = 0u32;
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.is_cancelled() {
             break;
         }
-        let poll_result = match poll_once(
-            &client,
-            &runner,
-            &journal,
-            &config,
-            &metrics,
-            &shutdown,
-            &shutdown_notify,
-        )
-        .await
-        {
-            Ok(poll_result) => poll_result,
-            Err(error) => {
-                if matches!(
-                    error.downcast_ref::<ClientError>(),
-                    Some(ClientError::Auth(_))
-                ) {
-                    warn!(error = %error, "agent authentication failed; re-registering");
-                    if !register_with_retry(&client, &metrics, &shutdown, &shutdown_notify).await? {
-                        break;
+        let poll_result =
+            match poll_once(&client, &runner, &journal, &config, &metrics, &shutdown).await {
+                Ok(poll_result) => poll_result,
+                Err(error) => {
+                    if matches!(
+                        error.downcast_ref::<ClientError>(),
+                        Some(ClientError::Auth(_))
+                    ) {
+                        warn!(error = %error, "agent authentication failed; re-registering");
+                        if !register_with_retry(&client, &metrics, &shutdown).await? {
+                            break;
+                        }
+                    } else {
+                        warn!(error = %error, "agent check-in failed");
                     }
-                } else {
-                    warn!(error = %error, "agent check-in failed");
+                    PollResult::Idle
                 }
-                PollResult::Idle
-            }
-        };
+            };
         let delay = match poll_result {
             PollResult::Shutdown => break,
             PollResult::Job { single } => {
@@ -156,7 +137,7 @@ async fn main() -> Result<()> {
                 if single {
                     break;
                 }
-                idle_backoff(config.check_interval, idle_round)
+                Duration::ZERO
             }
             PollResult::Idle => {
                 let delay = idle_backoff(config.check_interval, idle_round);
@@ -168,7 +149,7 @@ async fn main() -> Result<()> {
                 delay
             }
         };
-        if !sleep_until(delay, &shutdown, &shutdown_notify).await {
+        if !sleep_until(delay, &shutdown).await {
             break;
         }
     }
@@ -188,14 +169,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn forwarding_loop(client: Client, shutdown: Arc<AtomicBool>, interval: Duration) {
-    while !shutdown.load(Ordering::SeqCst) {
+async fn forwarding_loop(client: Client, shutdown: CancellationToken, interval: Duration) {
+    while !shutdown.is_cancelled() {
         match client.forward_once().await {
             Ok(true) => continue,
-            Ok(false) => time::sleep(interval).await,
+            Ok(false) => {
+                tokio::select! { _ = time::sleep(interval) => {}, _ = shutdown.cancelled() => break }
+            }
             Err(error) => {
                 warn!(error = %error, "agent request forwarding failed");
-                time::sleep(interval).await;
+                tokio::select! { _ = time::sleep(interval) => {}, _ = shutdown.cancelled() => break }
             }
         }
     }
@@ -208,10 +191,8 @@ async fn forwarding_loop(client: Client, shutdown: Arc<AtomicBool>, interval: Du
 /// termination and causes a non-success exit after deregistration.
 #[cfg(unix)]
 async fn wait_for_shutdown(
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
     force_exit: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-    runner_shutdown: CancellationToken,
     runner_force_shutdown: CancellationToken,
 ) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -228,14 +209,11 @@ async fn wait_for_shutdown(
         if first {
             first = false;
             info!("shutdown signal received; canceling the current job before exiting");
-            shutdown.store(true, Ordering::SeqCst);
-            runner_shutdown.cancel();
-            notify.notify_one();
+            shutdown.cancel();
         } else {
             warn!("second termination signal received; forcing job termination");
             force_exit.store(true, Ordering::SeqCst);
             runner_force_shutdown.cancel();
-            notify.notify_one();
             return;
         }
     }
@@ -243,33 +221,28 @@ async fn wait_for_shutdown(
 
 #[cfg(not(unix))]
 async fn wait_for_shutdown(
-    shutdown: Arc<AtomicBool>,
+    shutdown: CancellationToken,
     _force_exit: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-    runner_shutdown: CancellationToken,
     _runner_force_shutdown: CancellationToken,
 ) {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown signal received; canceling the current job before exiting");
-    shutdown.store(true, Ordering::SeqCst);
-    runner_shutdown.cancel();
-    notify.notify_one();
+    shutdown.cancel();
 }
 
 async fn register_with_retry(
     client: &Client,
     metrics: &Metrics,
-    shutdown: &Arc<AtomicBool>,
-    notify: &Arc<Notify>,
+    shutdown: &CancellationToken,
 ) -> Result<bool> {
     let mut delay = Duration::from_secs(1);
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.is_cancelled() {
             return Ok(false);
         }
         let result = tokio::select! {
             result = client.register() => result,
-            _ = notify.notified() => return Ok(false),
+            _ = shutdown.cancelled() => return Ok(false),
         };
         match result {
             Ok(agent_id) => {
@@ -284,7 +257,7 @@ async fn register_with_retry(
             Err(error) => {
                 metrics.registration_failed();
                 warn!(error = %error, retry_seconds = delay.as_secs(), "agent registration failed");
-                if !sleep_until(delay, shutdown, notify).await {
+                if !sleep_until(delay, shutdown).await {
                     return Ok(false);
                 }
                 delay = (delay * 2).min(Duration::from_secs(30));
@@ -307,10 +280,9 @@ async fn poll_once(
     journal: &Journal,
     config: &Config,
     metrics: &Metrics,
-    shutdown: &Arc<AtomicBool>,
-    notify: &Arc<Notify>,
+    shutdown: &CancellationToken,
 ) -> Result<PollResult> {
-    if shutdown.load(Ordering::SeqCst) {
+    if shutdown.is_cancelled() {
         return Ok(PollResult::Shutdown);
     }
     metrics.poll_started();
@@ -320,7 +292,7 @@ async fn poll_once(
     }
     let claim = tokio::select! {
         result = client.claim() => result,
-        _ = notify.notified() => return Ok(PollResult::Shutdown),
+        _ = shutdown.cancelled() => return Ok(PollResult::Shutdown),
     };
     let payload = match claim {
         Ok(Some(payload)) => payload,
@@ -332,7 +304,7 @@ async fn poll_once(
         }
     };
     metrics
-        .job_claimed(&payload.data.run_id, payload.phase.as_str())
+        .job_claimed(&payload.job_id, payload.phase.as_str())
         .await;
     info!(
         phase = payload.phase.as_str(),
@@ -366,9 +338,10 @@ async fn poll_once(
         Some(&payload.data.run_id),
         Some(payload.phase.as_str()),
     );
-    finish_journal_entry(client, runner, journal, journal_entry, metrics).await?;
+    let finish_result = finish_journal_entry(client, runner, journal, journal_entry, metrics).await;
     metrics.job_finished(completion_status == "finished");
     metrics.clear_job().await;
+    finish_result?;
     if config.single {
         info!("single-job mode complete");
         return Ok(PollResult::Job { single: true });
@@ -430,10 +403,53 @@ async fn finish_journal_entry(
         JournalState::CompletionAcked => entry,
         JournalState::CleanupDone => return Ok(()),
         JournalState::Claimed | JournalState::Executing => {
-            bail!(
-                "execution for job {} is already claimed without a durable completion; refusing to rerun",
-                entry.manifest.job_id
+            // A process restart can leave only the execution marker behind.
+            // Terminalize that stale claim instead of retrying the job or
+            // blocking every subsequent poll forever.
+            let completion = CompletionJob {
+                status: "errored",
+                error: Some("agent restarted before durable completion".to_owned()),
+                data: CompletionData {
+                    run_id: entry.manifest.run_id.clone(),
+                    operation: entry.manifest.phase.clone(),
+                    has_changes: false,
+                    generated_configuration: false,
+                    resource_additions: None,
+                    resource_changes: None,
+                    resource_destructions: None,
+                    resource_imports: None,
+                    action_failures: 1,
+                    action_invocations: 0,
+                    state: None,
+                    json_state: None,
+                    json_state_outputs: None,
+                    provenance_digest: None,
+                    log_incomplete: None,
+                    state_recovered: false,
+                    state_recovery_required: false,
+                    apply_error: None,
+                    state_recovery_error: None,
+                    lifecycle: Some("agent_restarted".to_owned()),
+                    state_digest: None,
+                    state_bytes: None,
+                    state_artifact: None,
+                },
+            };
+            let pending = journal.record_completion(
+                &entry,
+                &completion,
+                entry.manifest.work_dir.clone(),
+                false,
+            )?;
+            report_completion_details(
+                client,
+                &entry.manifest.phase,
+                &entry.manifest.run_id,
+                completion,
+                metrics,
             )
+            .await?;
+            journal.mark_completion_acked(&pending)?
         }
     };
     if entry.retain_work_dir {
@@ -456,13 +472,13 @@ fn idle_backoff(base: Duration, idle_round: u32) -> Duration {
     splayed(delay).min(Duration::from_secs(60))
 }
 
-async fn sleep_until(delay: Duration, shutdown: &Arc<AtomicBool>, notify: &Arc<Notify>) -> bool {
-    if shutdown.load(Ordering::SeqCst) {
+async fn sleep_until(delay: Duration, shutdown: &CancellationToken) -> bool {
+    if shutdown.is_cancelled() {
         return false;
     }
     tokio::select! {
         _ = time::sleep(delay) => true,
-        _ = notify.notified() => false,
+        _ = shutdown.cancelled() => false,
     }
 }
 

@@ -1,9 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -16,12 +16,13 @@ use reqwest::{Method, RequestBuilder, StatusCode, header, redirect::Policy};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use url::Url;
 
 use crate::config::{
     Config, SecretString, architecture, operating_system, request_forwarding_enabled,
+    validate_address,
 };
 use crate::protocol::{
     AgentId, AgentJobPayload, AgentRegistration, CompletionJob, ForwardedRequest,
@@ -96,6 +97,7 @@ pub struct Client {
     allow_insecure_http: bool,
     allow_private_artifacts: bool,
     artifact_idle_timeout: Duration,
+    artifact_clients: Arc<StdMutex<HashMap<String, reqwest::Client>>>,
     agent_id: Arc<Mutex<Option<AgentId>>>,
     session_token: Arc<Mutex<Option<SecretString>>>,
     message_index: Arc<AtomicU64>,
@@ -128,27 +130,19 @@ pub struct JobStatus {
 impl Client {
     pub fn new(config: Config) -> anyhow::Result<Self> {
         let allow_insecure_http = env_bool("TERRENCE_ALLOW_INSECURE_HTTP", false)? || cfg!(test);
-        let base_url =
-            Url::parse(&config.address).with_context(|| "TERRENCE_ADDRESS must be a valid URL")?;
-        if base_url.username() != "" || base_url.password().is_some() {
-            anyhow::bail!("TERRENCE_ADDRESS must not contain userinfo");
-        }
-        if base_url.scheme() != "https" && !allow_insecure_http && !cfg!(test) {
-            anyhow::bail!("TERRENCE_ADDRESS must use HTTPS");
-        }
-        if base_url.host_str().is_none() {
-            anyhow::bail!("TERRENCE_ADDRESS must include a host");
-        }
-        if !cfg!(test) {
-            if let Some(reason) = literal_private_host_reason(&base_url) {
-                anyhow::bail!("TERRENCE_ADDRESS points to {reason}");
-            }
-        }
-        let artifact_hosts = env_hosts_any(&[
+        let base_url = validate_address(&config.address, allow_insecure_http)?;
+        let mut artifact_hosts = env_hosts_any(&[
             "TERRENCE_AGENT_ARTIFACT_HOSTS",
             "TERRENCE_ARTIFACT_HOSTS",
             "TERRENCE_ARTIFACT_ALLOWLIST",
         ]);
+        for host in [
+            "releases.hashicorp.com",
+            "github.com",
+            "objects.githubusercontent.com",
+        ] {
+            artifact_hosts.insert(host.to_owned());
+        }
         let allow_private_artifacts = env_bool(
             "TERRENCE_ALLOW_PRIVATE_ARTIFACTS",
             env_bool("TERRENCE_ALLOW_PRIVATE_URLS", false)?,
@@ -176,6 +170,7 @@ impl Client {
             allow_insecure_http,
             allow_private_artifacts,
             artifact_idle_timeout,
+            artifact_clients: Arc::new(StdMutex::new(HashMap::new())),
             config: Arc::new(config),
             agent_id: Arc::new(Mutex::new(None)),
             session_token: Arc::new(Mutex::new(None)),
@@ -208,7 +203,7 @@ impl Client {
         let request = self
             .control_http
             .post(self.api_url("/api/agent/register"))
-            .headers(self.auth_headers()?)
+            .headers(self.auth_headers().await?)
             .header("content-type", "application/json")
             .header("tfc-agent-version", env!("CARGO_PKG_VERSION"))
             .header("tfc-agent-instance-id", self.config.instance_id.clone())
@@ -256,11 +251,7 @@ impl Client {
     }
 
     pub async fn job_status(&self, job_id: &str) -> Result<JobStatus, ClientError> {
-        if job_id.is_empty()
-            || !job_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
+        if crate::protocol::ValidatedId::new(job_id).is_err() {
             return Err(ClientError::InvalidPath {
                 path: job_id.to_owned(),
             });
@@ -469,10 +460,23 @@ impl Client {
         if method == Method::CONNECT || method == Method::TRACE {
             bail!("forwarded request method is not supported");
         }
-        let mut builder = self
-            .control_http
-            .request(method, url)
-            .timeout(Duration::from_secs(120));
+        let host = url
+            .host_str()
+            .context("forwarded request URL must include a host")?;
+        if matches!(
+            host.trim_end_matches('.').to_ascii_lowercase().as_str(),
+            "metadata.google.internal" | "instance-data.ec2.internal"
+        ) {
+            bail!("forwarded request cannot target cloud metadata");
+        }
+        let address = self
+            .validate_dns(&url, true)
+            .await?
+            .into_iter()
+            .next()
+            .context("forwarded request hostname returned no address")?;
+        let http = self.artifact_http_for(&ArtifactUrl(url.clone()), address)?;
+        let mut builder = http.request(method, url).timeout(Duration::from_secs(120));
         for (name, values) in &request.headers {
             if is_hop_by_hop_header(name) {
                 continue;
@@ -536,21 +540,111 @@ impl Client {
         self.get_artifact_retry(artifact, http).await
     }
 
-    pub async fn put_artifact(
-        &self,
-        url: &str,
-        bytes: Vec<u8>,
-        content_type: &str,
-    ) -> Result<(), ClientError> {
+    /// Stream an artifact to a private file, resuming a partial response with
+    /// a byte range instead of retaining the archive in memory.
+    pub async fn get_artifact_file(&self, url: &str, file_path: &Path) -> Result<(), ClientError> {
         let artifact = self.resolve_url(url)?;
         let address = self.validate_artifact_url(&artifact).await?;
+        let http = self.artifact_http_for(&artifact, address)?;
         let path = url_label_url(artifact.as_url());
-        let request = self
-            .artifact_http_for(&artifact, address)?
-            .put(artifact.as_url().clone())
-            .header("content-type", content_type)
-            .body(bytes);
-        self.send_empty(request, &path).await
+        let mut offset = tokio::fs::metadata(file_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let mut last_error = None;
+        for attempt in 0..MAX_ARTIFACT_ATTEMPTS {
+            let mut request = http.get(artifact.as_url().clone());
+            if offset > 0 {
+                request = request.header(header::RANGE, format!("bytes={offset}-"));
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(source) => {
+                    last_error = Some(ClientError::Network {
+                        path: path.clone(),
+                        source,
+                    });
+                    if attempt + 1 < MAX_ARTIFACT_ATTEMPTS {
+                        sleep_retry(attempt, None).await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            if response.status() == StatusCode::UNAUTHORIZED {
+                return Err(ClientError::Auth(path));
+            }
+            if !response.status().is_success() {
+                let error = self.http_error(response, &path).await;
+                if attempt + 1 < MAX_ARTIFACT_ATTEMPTS {
+                    last_error = Some(error);
+                    sleep_retry(attempt, None).await;
+                    continue;
+                }
+                return Err(error);
+            }
+            if offset > 0 && response.status() == StatusCode::OK {
+                offset = 0;
+            }
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true).create(true);
+            if offset == 0 {
+                options.truncate(true);
+            } else {
+                options.append(true);
+            }
+            let mut file = options
+                .open(file_path)
+                .await
+                .map_err(|source| ClientError::Io {
+                    path: file_path.display().to_string(),
+                    source,
+                })?;
+            let mut stream = response.bytes_stream();
+            let mut failed = None;
+            while let Some(chunk) = stream.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(source) => {
+                        failed = Some(ClientError::Network {
+                            path: path.clone(),
+                            source,
+                        });
+                        break;
+                    }
+                };
+                offset = offset.saturating_add(chunk.len() as u64);
+                if offset > MAX_ARTIFACT_BYTES as u64 {
+                    return Err(ClientError::ResponseTooLarge {
+                        path,
+                        limit: MAX_ARTIFACT_BYTES,
+                    });
+                }
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|source| ClientError::Io {
+                        path: file_path.display().to_string(),
+                        source,
+                    })?;
+            }
+            file.sync_all().await.map_err(|source| ClientError::Io {
+                path: file_path.display().to_string(),
+                source,
+            })?;
+            if let Some(error) = failed {
+                last_error = Some(error);
+                if attempt + 1 < MAX_ARTIFACT_ATTEMPTS {
+                    sleep_retry(attempt, None).await;
+                    continue;
+                }
+                break;
+            }
+            return Ok(());
+        }
+        Err(last_error.unwrap_or_else(|| ClientError::Transport {
+            path,
+            reason: "artifact file request failed".to_owned(),
+        }))
     }
 
     /// Upload a file without buffering the complete artifact in memory.
@@ -789,7 +883,20 @@ impl Client {
                 host: host.to_owned(),
                 reason: "URL has no known port".to_owned(),
             })?;
-        reqwest::Client::builder()
+        let key = format!("{host}:{port}:{address}");
+        if let Some(client) = self
+            .artifact_clients
+            .lock()
+            .map_err(|_| ClientError::Transport {
+                path: url_label_url(artifact.as_url()),
+                reason: "artifact client cache is poisoned".to_owned(),
+            })?
+            .get(&key)
+            .cloned()
+        {
+            return Ok(client);
+        }
+        let client = reqwest::Client::builder()
             .redirect(Policy::none())
             .user_agent(format!("terrence-agent/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(CONTROL_CONNECT_TIMEOUT)
@@ -802,7 +909,15 @@ impl Client {
             .map_err(|error| ClientError::Transport {
                 path: url_label_url(artifact.as_url()),
                 reason: format!("build pinned artifact client: {error}"),
-            })
+            })?;
+        self.artifact_clients
+            .lock()
+            .map_err(|_| ClientError::Transport {
+                path: url_label_url(artifact.as_url()),
+                reason: "artifact client cache is poisoned".to_owned(),
+            })?
+            .insert(key, client.clone());
+        Ok(client)
     }
 
     async fn get_artifact_retry(
@@ -921,10 +1036,11 @@ impl Client {
         }))
     }
 
-    fn auth_headers(&self) -> Result<reqwest::header::HeaderMap, ClientError> {
-        let token = self
-            .config
-            .current_token()
+    async fn auth_headers(&self) -> Result<reqwest::header::HeaderMap, ClientError> {
+        let config = Arc::clone(&self.config);
+        let token = tokio::task::spawn_blocking(move || config.current_token())
+            .await
+            .map_err(|error| ClientError::Auth(format!("unable to load agent token: {error}")))?
             .map_err(|error| ClientError::Auth(format!("unable to load agent token: {error:#}")))?;
         self.token_headers(&token)
     }
@@ -950,7 +1066,7 @@ impl Client {
         let session_token = self.session_token.lock().await.clone();
         let mut headers = match session_token {
             Some(token) => self.token_headers(&token)?,
-            None => self.auth_headers()?,
+            None => self.auth_headers().await?,
         };
         headers.insert(
             "tfc-agent-id",
@@ -1580,9 +1696,11 @@ mod tests {
     #[tokio::test]
     async fn job_status_rejects_path_injection() {
         let client = Client::new(config("https://terrence.example".to_owned())).unwrap();
-        assert!(matches!(
-            client.job_status("job/../../status").await,
-            Err(ClientError::InvalidPath { .. })
-        ));
+        for candidate in ["", ".", "..", "job/../../status"] {
+            assert!(matches!(
+                client.job_status(candidate).await,
+                Err(ClientError::InvalidPath { .. })
+            ));
+        }
     }
 }

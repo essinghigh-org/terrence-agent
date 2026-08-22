@@ -7,7 +7,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc;
@@ -20,6 +20,33 @@ use crate::client::Client;
 const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(750);
 const LOG_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_SPOOL_BYTES: u64 = 64 * 1024 * 1024;
+const SPOOL_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Remove only old, inactive per-run spools. Recent spools remain available
+/// for replay after a transient control-plane outage.
+pub fn cleanup_stale_spools(root: &Path) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let now = SystemTime::now();
+    for entry in fs::read_dir(root).with_context(|| format!("read log spool {}", root.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > SPOOL_RETENTION);
+        if stale {
+            fs::remove_dir_all(entry.path())
+                .with_context(|| format!("remove stale log spool {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default)]
 pub struct LogDelivery {
@@ -347,6 +374,14 @@ async fn flush_chunk(
         incomplete.store(true, Ordering::Release);
         return;
     };
+    let backlog = match spool.pending() {
+        Ok(pending) => !pending.is_empty(),
+        Err(error) => {
+            incomplete.store(true, Ordering::Release);
+            warn!(error = %error, "failed to inspect log spool before upload");
+            true
+        }
+    };
     let sequence = spool.allocate_sequence();
     let path = match spool.store(sequence, ChunkKind::Chunk, &bytes) {
         Ok(path) => path,
@@ -361,6 +396,11 @@ async fn flush_chunk(
         kind: ChunkKind::Chunk,
         path,
     };
+    if backlog {
+        // Preserve wire ordering: replay the oldest durable sequence before
+        // attempting this newly persisted chunk.
+        return;
+    }
     if retry_log(sequence, || {
         client.patch_log_chunk(url, sequence, bytes.clone())
     })
@@ -432,6 +472,7 @@ async fn replay_pending(
             }
             Err(error) => {
                 warn!(sequence = chunk.sequence, error = %error, "log chunk upload failed; will retry");
+                break;
             }
         }
     }
@@ -458,6 +499,7 @@ async fn finish_log(
     };
     if pending.iter().any(|chunk| chunk.kind == ChunkKind::Chunk) {
         incomplete.store(true, Ordering::Release);
+        return;
     }
     let existing_terminator = pending
         .iter()

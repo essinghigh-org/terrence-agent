@@ -20,7 +20,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::archive::{extract_tar_gz, flatten_single_directory, pack_tar_gz};
+use crate::archive::{extract_tar_gz_file, flatten_single_directory, pack_tar_gz_file};
 use crate::client::Client;
 use crate::config::{
     Config, ensure_private_dir, is_loader_variable, validate_environment_entry,
@@ -35,8 +35,8 @@ use crate::protocol::{
 };
 use crate::provenance::{
     AgentMetadata, ExecutionManifest as ProvenanceManifest, SandboxMetadata, ToolMetadata,
-    bytes_digest, file_digest, input_state_digest, lock_file_digest, now_unix_seconds, persist,
-    provider_digests, read, safe_environment, snapshot_digest,
+    file_digest, input_state_digest, lock_file_digest, now_unix_seconds, persist, provider_digests,
+    read, safe_environment, snapshot_digest,
 };
 use crate::provider_cache::ProviderCache;
 use crate::sandbox::{Sandbox, terminate_child};
@@ -553,17 +553,18 @@ impl Runner {
         exec_dir: &Path,
         deadline: JobDeadline,
     ) -> Result<String> {
-        let archive = self
-            .await_deadline(
-                deadline,
-                "download configuration archive",
-                self.client
-                    .get_artifact(&payload.data.configuration_version_url),
-            )
-            .await
-            .context("download configuration archive")?;
-        let config_digest = bytes_digest(&archive);
-        extract_tar_gz(&archive, work_dir).context("extract configuration archive")?;
+        let archive_path = work_dir.join("tmp/configuration.tar.gz");
+        fs::create_dir_all(archive_path.parent().expect("tmp archive parent"))?;
+        self.await_deadline(
+            deadline,
+            "download configuration archive",
+            self.client
+                .get_artifact_file(&payload.data.configuration_version_url, &archive_path),
+        )
+        .await
+        .context("download configuration archive")?;
+        let config_digest = crate::provenance::file_digest(&archive_path)?;
+        extract_tar_gz_file(&archive_path, work_dir).context("extract configuration archive")?;
         flatten_single_directory(work_dir).context("flatten configuration archive")?;
         fs::create_dir_all(exec_dir)?;
         write_cli_config(
@@ -582,15 +583,18 @@ impl Runner {
         exec_dir: &Path,
         deadline: JobDeadline,
     ) -> Result<(ProvenanceManifest, String)> {
-        let snapshot = self
-            .await_deadline(
-                deadline,
-                "download plan filesystem snapshot",
-                self.client.get_artifact(&payload.data.filesystem_url),
-            )
-            .await
-            .context("download plan filesystem snapshot")?;
-        extract_tar_gz(&snapshot, work_dir).context("extract plan filesystem snapshot")?;
+        let snapshot_path = work_dir.join("tmp/plan-snapshot.tar.gz");
+        fs::create_dir_all(snapshot_path.parent().expect("tmp archive parent"))?;
+        self.await_deadline(
+            deadline,
+            "download plan filesystem snapshot",
+            self.client
+                .get_artifact_file(&payload.data.filesystem_url, &snapshot_path),
+        )
+        .await
+        .context("download plan filesystem snapshot")?;
+        extract_tar_gz_file(&snapshot_path, work_dir)
+            .context("extract plan filesystem snapshot")?;
         fs::create_dir_all(exec_dir)?;
         write_cli_config(
             work_dir,
@@ -616,6 +620,7 @@ impl Runner {
     ) -> Result<RunResult> {
         match &payload.phase {
             Phase::Plan => {
+                let phase_started_at = now_unix_seconds();
                 let init_args = vec![
                     "init".to_owned(),
                     "-reconfigure".to_owned(),
@@ -777,7 +782,7 @@ impl Runner {
                 )?;
                 let plan_digest = file_digest(&exec_dir.join("tfplan"))?;
                 let manifest = ProvenanceManifest {
-                    schema_version: 1,
+                    schema_version: 2,
                     run_id: payload.data.run_id.clone(),
                     job_id: payload.job_id.clone(),
                     phase: "plan".to_owned(),
@@ -803,17 +808,19 @@ impl Runner {
                     input_state_digest: input_state_digest(exec_dir)?,
                     output_state_digest: None,
                     source_manifest_digest: None,
-                    started_at: now_unix_seconds(),
+                    started_at: phase_started_at,
                     completed_at: now_unix_seconds(),
                 };
                 let provenance_digest = persist(&manifest, work_dir)?;
-                let snapshot = pack_tar_gz(work_dir).context("pack plan filesystem snapshot")?;
+                let snapshot_path = work_dir.join("tmp/plan-snapshot.tar.gz");
+                pack_tar_gz_file(work_dir, &snapshot_path)
+                    .context("pack plan filesystem snapshot")?;
                 self.await_deadline(
                     deadline,
                     "upload plan filesystem snapshot",
-                    self.client.put_artifact(
+                    self.client.put_artifact_file(
                         &payload.data.filesystem_url,
-                        snapshot,
+                        &snapshot_path,
                         "application/gzip",
                     ),
                 )
@@ -843,6 +850,7 @@ impl Runner {
                 })
             }
             Phase::Apply => {
+                let phase_started_at = now_unix_seconds();
                 let counts = read_plan_metadata(work_dir).unwrap_or_else(|| {
                     warn!(
                         run_id = %payload.data.run_id,
@@ -1027,7 +1035,7 @@ impl Runner {
                 let mut state_bytes = None;
                 let mut state_artifact = None;
                 let mut state_text = None;
-                let json_state = None;
+                let json_state = state_text.clone();
                 let mut json_state_outputs = None;
                 let mut state_commit_error = None;
 
@@ -1117,7 +1125,7 @@ impl Runner {
                 manifest.sandbox = self.sandbox_metadata();
                 manifest.output_state_digest = state_digest.clone();
                 manifest.source_manifest_digest = preparation.manifest_digest.clone();
-                manifest.started_at = now_unix_seconds();
+                manifest.started_at = phase_started_at;
                 manifest.completed_at = now_unix_seconds();
                 let provenance_digest = persist(&manifest, work_dir)?;
                 Ok(RunResult {
@@ -1151,7 +1159,7 @@ impl Runner {
         environment: &[(String, String)],
         manifest: &ProvenanceManifest,
     ) -> Result<()> {
-        if manifest.schema_version != 1 {
+        if manifest.schema_version != 2 {
             bail!(
                 "unsupported execution manifest schema {}",
                 manifest.schema_version
@@ -2043,14 +2051,18 @@ fn format_error(error: &anyhow::Error) -> String {
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn drain_task<T>(task: JoinHandle<Result<T>>, name: &str) {
+    let abort = task.abort_handle();
     match time::timeout(READER_DRAIN_TIMEOUT, task).await {
         Ok(Ok(Ok(_))) => {}
         Ok(Ok(Err(error))) => warn!(reader = name, error = %error, "command output reader failed"),
         Ok(Err(error)) => warn!(reader = name, error = %error, "command output reader panicked"),
-        Err(_) => warn!(
-            reader = name,
-            "command output reader did not drain before timeout"
-        ),
+        Err(_) => {
+            abort.abort();
+            warn!(
+                reader = name,
+                "command output reader did not drain before timeout"
+            );
+        }
     }
 }
 
@@ -2090,7 +2102,19 @@ async fn write_limited_file<R>(mut reader: R, path: PathBuf, limit: u64) -> Resu
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut output = tokio::fs::File::create(&path)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut private = std::fs::OpenOptions::new();
+        private.write(true).create(true).truncate(true).mode(0o600);
+        private
+            .open(&path)
+            .with_context(|| format!("create state file {}", path.display()))?;
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    let mut output = options
+        .open(&path)
         .await
         .with_context(|| format!("create state file {}", path.display()))?;
     let mut buffer = [0_u8; 64 * 1024];

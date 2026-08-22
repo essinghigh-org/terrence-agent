@@ -8,6 +8,7 @@ umask 022
 # CFLAGS/LDFLAGS from a caller. The helper is security-sensitive and should be
 # built with the same warnings and hardening in local builds, CI, and Docker.
 CC=${CC:-cc}
+# shellcheck disable=SC1007  # CDPATH= intentionally clears CDPATH here.
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$script_dir"
 

@@ -278,7 +278,7 @@ fn parse_accept_values(value: &str) -> Result<Vec<WorkloadType>> {
     Ok(parsed)
 }
 
-fn validate_address(value: &str, allow_insecure_http: bool) -> Result<()> {
+pub(crate) fn validate_address(value: &str, allow_insecure_http: bool) -> Result<Url> {
     let address = Url::parse(value).with_context(|| "TERRENCE_ADDRESS must be a valid URL")?;
     if address.username() != "" || address.password().is_some() {
         bail!("TERRENCE_ADDRESS must not contain userinfo");
@@ -289,38 +289,66 @@ fn validate_address(value: &str, allow_insecure_http: bool) -> Result<()> {
     if host.contains('%') {
         bail!("TERRENCE_ADDRESS host must not contain percent-encoded bytes");
     }
-    let literal = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-        .ok();
-    let metadata_name = matches!(
-        host.trim_end_matches('.').to_ascii_lowercase().as_str(),
-        "metadata.google.internal" | "instance-data.ec2.internal"
-    );
-    let metadata = literal.is_some_and(|ip| match ip {
-        IpAddr::V4(ip) => ip.octets() == [169, 254, 169, 254],
-        IpAddr::V6(ip) => ip
-            .to_ipv4()
-            .is_some_and(|ip| ip.octets() == [169, 254, 169, 254]),
-    });
-    let local = host.eq_ignore_ascii_case("localhost")
-        || literal.is_some_and(|ip| match ip {
-            IpAddr::V4(ip) => ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
-            IpAddr::V6(ip) => {
-                ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80
-            }
-        });
-    if metadata_name || metadata || (local && !allow_insecure_http) {
-        bail!("TERRENCE_ADDRESS points to a private or metadata host");
+    if !cfg!(test) {
+        if let Some(reason) = private_address_reason(host) {
+            bail!("TERRENCE_ADDRESS points to {reason}");
+        }
     }
     match address.scheme() {
-        "https" => Ok(()),
-        "http" if allow_insecure_http => Ok(()),
+        "https" => Ok(address),
+        "http" if allow_insecure_http => Ok(address),
         "http" => bail!(
             "TERRENCE_ADDRESS must use HTTPS (set TERRENCE_ALLOW_INSECURE_HTTP=true only for local testing)"
         ),
         _ => bail!("TERRENCE_ADDRESS must use HTTPS"),
+    }
+}
+
+fn private_address_reason(host: &str) -> Option<&'static str> {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "localhost" | "metadata.google.internal" | "instance-data.ec2.internal"
+    ) {
+        return Some(if normalized == "localhost" {
+            "loopback address"
+        } else {
+            "cloud metadata address"
+        });
+    }
+    let ip = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .ok()?;
+    if matches!(ip, IpAddr::V4(ip) if ip.octets() == [169, 254, 169, 254])
+        || matches!(ip, IpAddr::V6(ip) if ip.to_ipv4().is_some_and(|ip| ip.octets() == [169, 254, 169, 254]))
+    {
+        return Some("cloud metadata address");
+    }
+    match ip {
+        IpAddr::V4(ip) if ip.is_loopback() => Some("loopback address"),
+        IpAddr::V4(ip)
+            if ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+                || (ip.octets()[0] == 192 && ip.octets()[1] == 0 && ip.octets()[2] == 0)
+                || ip.octets()[0] >= 240 =>
+        {
+            Some("private or reserved address")
+        }
+        IpAddr::V6(ip)
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80 =>
+        {
+            Some("private or reserved address")
+        }
+        _ => None,
     }
 }
 
@@ -843,6 +871,10 @@ mod tests {
             std::env::remove_var("TERRENCE_AGENT_TOKEN_FILE");
             std::env::remove_var("TFC_AGENT_TOKEN_FILE");
             std::env::set_var("TERRENCE_AGENT_TOKEN", "tok");
+            std::env::remove_var("TERRENCE_AGENT_DISPLAY_NAME");
+            std::env::remove_var("TERRENCE_AGENT_NAME");
+            std::env::remove_var("TFC_AGENT_NAME");
+            std::env::remove_var("TERRENCE_AGENT_HOSTNAME");
             std::env::remove_var("TERRENCE_AGENT_INSTANCE_ID");
         }
         let first = Config::from_env().unwrap();

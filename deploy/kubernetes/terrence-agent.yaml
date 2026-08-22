@@ -45,6 +45,8 @@ spec:
               terrence.io/pool: default
       containers:
         - name: terrence-agent
+          # Pin this reference to the release digest produced by the image
+          # pipeline before applying a production deployment.
           image: ghcr.io/essinghigh-org/terrence-agent:0.1.0
           imagePullPolicy: IfNotPresent
           env:

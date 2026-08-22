@@ -17,6 +17,7 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
+use tokio::time;
 use tracing::{info, warn};
 
 /// Timeline names intentionally mirror the server-side names described in the
@@ -297,7 +298,8 @@ async fn serve(listener: TcpListener, metrics: Metrics) {
             Ok(value) => value,
             Err(error) => {
                 warn!(error = %error, "local health listener failed");
-                return;
+                time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
         };
         let metrics = metrics.clone();
@@ -350,11 +352,9 @@ async fn handle_connection(mut stream: TcpStream, metrics: Metrics) -> Result<()
             }
             "/doctor" => {
                 let ready = metrics.inner.registered.load(Ordering::Acquire);
-                (
-                    200,
-                    "application/json",
-                    metrics.json(ready).await.to_string(),
-                )
+                let mut body = metrics.json(ready).await;
+                body["mode"] = json!("health_snapshot");
+                (200, "application/json", body.to_string())
             }
             "/metrics" => {
                 let ready = metrics.inner.registered.load(Ordering::Acquire);
@@ -376,7 +376,12 @@ async fn handle_connection(mut stream: TcpStream, metrics: Metrics) -> Result<()
         reason(status),
         body.len()
     );
-    stream.write_all(response.as_bytes()).await?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        stream.write_all(response.as_bytes()),
+    )
+    .await
+    .context("write health response timed out")??;
     Ok(())
 }
 

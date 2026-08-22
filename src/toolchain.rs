@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -231,10 +232,11 @@ impl ToolchainResolver {
             executable_sha256: executable_checksum,
         };
         let metadata_path = temp_dir.join("metadata.json");
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut output = options
             .open(&metadata_path)
             .context("create IaC cache metadata")?;
         serde_json::to_writer(&mut output, &metadata).context("write IaC cache metadata")?;
@@ -296,7 +298,10 @@ impl ToolchainResolver {
         {
             bail!("cache metadata does not match the requested toolchain");
         }
-        let actual_checksum = digest_file(&executable)?;
+        let digest_path = executable.clone();
+        let actual_checksum = tokio::task::spawn_blocking(move || digest_file(&digest_path))
+            .await
+            .context("join cached binary digest task")??;
         if actual_checksum != metadata.executable_sha256 {
             bail!("cached binary digest does not match cache metadata");
         }
@@ -469,11 +474,14 @@ async fn version_matches(path: &Path, product: Product, requested: &str) -> bool
 }
 
 async fn binary_version(path: &Path, _product: Product) -> Result<String> {
-    let output = Command::new(path)
+    let mut command = Command::new(path);
+    command
         .args(["version", "-json"])
         .stdin(std::process::Stdio::null())
-        .output()
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(15), command.output())
         .await
+        .with_context(|| format!("run {} version -json timed out", path.display()))?
         .with_context(|| format!("run {} version -json", path.display()))?;
     if !output.status.success() {
         bail!(

@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -13,6 +14,7 @@ use crate::manifest::ExecutionManifest;
 use crate::protocol::{CompletionData, CompletionJob};
 
 const JOURNAL_DIR: &str = "journal";
+const JOURNAL_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Durable local execution states.  A record with a completion is safe to
 /// resend; no state below `completion_pending` may execute the job again.
@@ -95,7 +97,9 @@ impl Journal {
         fs::create_dir_all(&root)
             .with_context(|| format!("create execution journal {}", root.display()))?;
         set_private_permissions(&root, 0o700)?;
-        Ok(Self { root })
+        let journal = Self { root };
+        journal.prune_expired()?;
+        Ok(journal)
     }
 
     pub fn start(&self, manifest: ExecutionManifest) -> Result<JournalEntry> {
@@ -154,7 +158,9 @@ impl Journal {
     pub fn mark_cleanup_done(&self, entry: &JournalEntry) -> Result<JournalEntry> {
         // The control-plane ACK makes the completion payload disposable. Keep
         // only the manifest/fingerprint so a duplicate claim cannot execute.
-        self.update(entry, JournalState::CleanupDone, None)
+        let entry = self.update(entry, JournalState::CleanupDone, None)?;
+        self.prune_expired()?;
+        Ok(entry)
     }
 
     /// Return records that still need a control-plane acknowledgement or local
@@ -225,7 +231,6 @@ impl Journal {
                 path.display()
             );
         }
-        set_private_permissions(path, 0o600)?;
         let file =
             File::open(path).with_context(|| format!("open journal record {}", path.display()))?;
         let raw: JournalFile = serde_json::from_reader(BufReader::new(file))
@@ -256,6 +261,36 @@ impl Journal {
         hasher.update(job_id.as_bytes());
         self.root.join(format!("{:x}.json", hasher.finalize()))
     }
+
+    fn prune_expired(&self) -> Result<()> {
+        let now = SystemTime::now();
+        for item in fs::read_dir(&self.root)? {
+            let item = item?;
+            if item.file_type()?.is_symlink()
+                || item.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let Some(age) = item
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+            else {
+                continue;
+            };
+            if age <= JOURNAL_RETENTION {
+                continue;
+            }
+            let Ok(entry) = self.read(&item.path()) else {
+                continue;
+            };
+            if entry.state == JournalState::CleanupDone && !entry.retain_work_dir {
+                let _ = fs::remove_file(item.path());
+            }
+        }
+        Ok(())
+    }
 }
 
 fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
@@ -269,7 +304,8 @@ fn set_private_permissions(path: &Path, mode: u32) -> Result<()> {
 fn set_private_mode(options: &mut OpenOptions, mode: u32) {
     #[cfg(unix)]
     options.mode(mode);
-    let _ = mode;
+    #[cfg(not(unix))]
+    let _ = (options, mode);
 }
 
 fn sync_directory(path: &Path) {

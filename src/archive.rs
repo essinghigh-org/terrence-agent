@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Cursor, Read, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -28,6 +30,7 @@ const MAX_GZIP_EXPANSION_RATIO: u64 = 1_000;
 ///
 /// New callers should prefer [`extract_tar_gz_file`] so the compressed archive
 /// is never materialized in the process heap.
+#[cfg(test)]
 pub fn extract_tar_gz(bytes: &[u8], destination: &Path) -> Result<()> {
     if bytes.len() as u64 > MAX_SNAPSHOT_BYTES as u64 {
         bail!(
@@ -192,15 +195,15 @@ pub fn flatten_single_directory(destination: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Pack a snapshot into a bounded in-memory buffer.
+/// Pack a snapshot into a bounded in-memory buffer for unit tests.
+#[cfg(test)]
 pub fn pack_tar_gz(source: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     pack_tar_gz_into(source, &mut bytes)?;
     Ok(bytes)
 }
 
-/// Pack a snapshot directly to a private file, enforcing the same output cap
-/// as [`pack_tar_gz`].
+/// Pack a snapshot directly to a private file, enforcing the output cap.
 #[allow(dead_code)]
 pub fn pack_tar_gz_file(source: &Path, archive_path: &Path) -> Result<()> {
     let source_root = fs::canonicalize(source)

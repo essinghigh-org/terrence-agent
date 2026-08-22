@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::sandbox::Sandbox;
 
-const USAGE: &str = "Usage: terrence-agent [--version|doctor|check-config|probe-sandbox|list-capabilities|connectivity-test|cache verify|cache prune]";
+const USAGE: &str = "Usage: terrence-agent [--help|-h|--version|-V|--offline|doctor [--support-bundle PATH|--support-bundle=PATH]|check-config|probe-sandbox|list-capabilities|connectivity-test|cache verify|cache prune]";
 
 #[derive(Clone, Debug, Serialize)]
 struct Check {
@@ -49,7 +49,8 @@ fn list_capabilities(args: &[String]) -> Result<()> {
     if args.len() != 1 {
         bail!("list-capabilities takes no arguments");
     }
-    println!("[\"terraform\",\"tofu\"]");
+    let config = Config::from_env().context("load agent configuration")?;
+    println!("{}", serde_json::to_string(&config.iac_binaries())?);
     Ok(())
 }
 
@@ -104,10 +105,20 @@ fn verify_cache(config: &Config) -> Result<()> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        entries += 1;
-        let binary = entry.path().join("terraform");
-        if !is_executable_file(&binary) {
-            invalid.push(entry.file_name().to_string_lossy().into_owned());
+        let product = entry.file_name().to_string_lossy().into_owned();
+        if !matches!(product.as_str(), "terraform" | "tofu") {
+            continue;
+        }
+        for cache_entry in fs::read_dir(entry.path())? {
+            let cache_entry = cache_entry?;
+            if !cache_entry.file_type()?.is_dir() {
+                continue;
+            }
+            entries += 1;
+            let binary = cache_entry.path().join(&product);
+            if !is_executable_file(&binary) {
+                invalid.push(cache_entry.path().display().to_string());
+            }
         }
     }
     if invalid.is_empty() {
@@ -135,11 +146,21 @@ fn prune_cache(config: &Config) -> Result<()> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let path = entry.path();
-        if !is_executable_file(&path.join("terraform")) {
-            fs::remove_dir_all(&path)
-                .with_context(|| format!("remove invalid cache entry {}", path.display()))?;
-            removed += 1;
+        let product = entry.file_name().to_string_lossy().into_owned();
+        if !matches!(product.as_str(), "terraform" | "tofu") {
+            continue;
+        }
+        for cache_entry in fs::read_dir(entry.path())? {
+            let cache_entry = cache_entry?;
+            if !cache_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = cache_entry.path();
+            if !is_executable_file(&path.join(&product)) {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("remove invalid cache entry {}", path.display()))?;
+                removed += 1;
+            }
         }
     }
     println!("pruned {removed} invalid cache entries");
@@ -296,19 +317,24 @@ fn config_detail(config: &Config) -> String {
 }
 
 fn path_check(name: &str, path: &Path) -> Check {
-    let detail = match fs::metadata(path) {
-        Ok(metadata) if metadata.is_dir() => format!("{} (directory)", path.display()),
-        Ok(_) => format!("{} is not a directory", path.display()),
+    let (ok, detail) = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => (true, format!("{} (directory)", path.display())),
+        Ok(_) => (false, format!("{} is not a directory", path.display())),
         Err(_) => match path.parent().filter(|parent| parent.is_dir()) {
-            Some(parent) => format!(
-                "{} (will be created under {})",
-                path.display(),
-                parent.display()
+            Some(parent) => (
+                true,
+                format!(
+                    "{} (will be created under {})",
+                    path.display(),
+                    parent.display()
+                ),
             ),
-            None => format!("{} and its parent do not exist", path.display()),
+            None => (
+                false,
+                format!("{} and its parent do not exist", path.display()),
+            ),
         },
     };
-    let ok = !detail.contains(" is not a directory") && !detail.contains("do not exist");
     Check {
         name: name.to_owned(),
         ok,
@@ -448,7 +474,48 @@ fn binary_check(name: &str, configured: Option<&Path>) -> Check {
             detail: "binary not found".to_owned(),
         };
     };
-    let output = Command::new(&path).arg("--version").output();
+    let mut child = match Command::new(&path)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return Check {
+                name: format!("{name} version"),
+                ok: false,
+                detail: format!("{}: {error}", path.display()),
+            };
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Check {
+                    name: format!("{name} version"),
+                    ok: false,
+                    detail: "version probe timed out".to_owned(),
+                };
+            }
+            Err(error) => {
+                return Check {
+                    name: format!("{name} version"),
+                    ok: false,
+                    detail: format!("{}: {error}", path.display()),
+                };
+            }
+        }
+    }
+    let output = child.wait_with_output();
     match output {
         Ok(output) if output.status.success() => Check {
             name: format!("{name} version"),

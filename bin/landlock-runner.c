@@ -182,7 +182,7 @@ static int add_path_rule(int ruleset_fd, uint64_t access, const char *path) {
         /* Directory-only rights make the kernel reject file/device rules. */
         access &= ~(LL_READ_DIR | LL_REMOVE_DIR | LL_MAKE_CHAR | LL_MAKE_DIR |
                     LL_MAKE_REG | LL_MAKE_SOCK | LL_MAKE_FIFO | LL_MAKE_BLOCK |
-                    LL_MAKE_SYM);
+                    LL_MAKE_SYM | LL_REMOVE_FILE | LL_REFER);
     }
 
     struct landlock_path_beneath_attr rule = {0};

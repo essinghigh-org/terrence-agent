@@ -627,15 +627,15 @@ pub struct CompletionData {
     pub resource_imports: Option<u64>,
     pub action_failures: u64,
     pub action_invocations: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json_state_outputs: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance_digest: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_incomplete: Option<bool>,
     #[serde(default)]
     pub state_recovered: bool,

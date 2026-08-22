@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::process::{Child, Command};
 
-use crate::config::Config;
+use crate::config::{Config, is_loader_variable};
 use crate::provider_cache::ProviderCache;
 
 pub struct Sandbox {
@@ -295,21 +295,6 @@ fn profile_name(profile: SandboxProfile) -> &'static str {
         SandboxProfile::Provisioner => "provisioner",
         SandboxProfile::Compatibility => "compatibility",
     }
-}
-
-fn is_loader_variable(key: &str) -> bool {
-    matches!(
-        key,
-        "LD_PRELOAD"
-            | "LD_LIBRARY_PATH"
-            | "LD_AUDIT"
-            | "LD_DEBUG"
-            | "LD_DEBUG_OUTPUT"
-            | "LD_ORIGIN_PATH"
-            | "LD_ASSUME_KERNEL"
-            | "LD_PROFILE"
-            | "LD_USE_LOAD_BIAS"
-    )
 }
 
 fn resolv_conf_dir() -> Option<PathBuf> {

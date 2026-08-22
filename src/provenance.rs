@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -124,14 +124,25 @@ pub fn snapshot_digest(root: &Path) -> Result<String> {
     files.sort();
 
     let mut hasher = Sha256::new();
-    hasher.update(b"terrence-execution-snapshot-v1\0");
+    hasher.update(b"terrence-execution-snapshot-v2\0");
     for relative in files {
         let path = root.join(&relative);
         let relative = relative.to_string_lossy();
-        let bytes =
-            fs::read(&path).with_context(|| format!("read {} for hashing", path.display()))?;
+        let mut file =
+            File::open(&path).with_context(|| format!("read {} for hashing", path.display()))?;
         update_frame(&mut hasher, relative.as_bytes());
-        update_frame(&mut hasher, &bytes);
+        let length = file.metadata()?.len();
+        hasher.update(length.to_le_bytes());
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("read {} for hashing", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -235,6 +246,7 @@ fn excluded_snapshot_path(path: &Path) -> bool {
             .components()
             .next()
             .is_some_and(|component| matches!(component, std::path::Component::Normal(value) if value == "secrets" || value == "tmp"))
+        || path.starts_with(Path::new(".terraform/providers"))
 }
 
 fn update_frame(hasher: &mut Sha256, bytes: &[u8]) {
@@ -250,9 +262,24 @@ pub fn bytes_digest(bytes: &[u8]) -> String {
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension("tmp");
-    fs::write(&temporary, bytes).with_context(|| format!("write {}", temporary.display()))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("write {}", temporary.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all().context("sync execution manifest")?;
+    drop(file);
     fs::rename(&temporary, path)
         .with_context(|| format!("install execution manifest {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)
+            .with_context(|| format!("open manifest directory {}", parent.display()))?
+            .sync_all()
+            .context("sync manifest directory")?;
+    }
     Ok(())
 }
 
@@ -314,7 +341,7 @@ mod tests {
     fn persist_writes_snapshot_copy_and_sidecar() {
         let directory = tempdir().unwrap();
         let manifest = ExecutionManifest {
-            schema_version: 1,
+            schema_version: 2,
             run_id: "run".to_owned(),
             job_id: "job".to_owned(),
             phase: "plan".to_owned(),
