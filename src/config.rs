@@ -1,12 +1,16 @@
 use std::env;
 use std::fmt;
 use std::fs;
+use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use url::Url;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 /// A token that does not reveal its value through formatting or debug output.
 #[derive(Clone)]
@@ -421,6 +425,207 @@ pub fn operating_system() -> &'static str {
     std::env::consts::OS
 }
 
+/// Set a restrictive process umask before any job or credential files exist.
+pub(crate) fn set_restrictive_umask() {
+    #[cfg(unix)]
+    // SAFETY: umask is process-local and accepts any mode_t value.
+    unsafe {
+        libc::umask(0o077);
+    }
+}
+
+/// Optionally disable core dumps, which can otherwise retain credentials and
+/// Terraform state after a crash.
+pub(crate) fn maybe_disable_core_dumps() -> Result<()> {
+    let requested = env_value(&[
+        "TERRENCE_AGENT_NO_CORE_DUMPS",
+        "TERRENCE_AGENT_DISABLE_CORE_DUMPS",
+    ])
+    .map(|value| parse_bool(Some(&value), false))
+    .transpose()?
+    .unwrap_or(false);
+    if !requested {
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    {
+        let limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is a valid rlimit value and RLIMIT_CORE is a valid
+        // resource selector on Unix platforms exposing this API.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
+            return Err(io::Error::last_os_error()).context("disable core dumps");
+        }
+    }
+    Ok(())
+}
+
+/// Create or validate an agent-owned private directory.
+pub(crate) fn ensure_private_dir(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("{label} path is empty");
+    }
+    if !path.exists() {
+        fs::create_dir_all(path).with_context(|| format!("create {label} {}", path.display()))?;
+    }
+    reject_symlink_components(path, label)?;
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("{label} is not a directory: {}", path.display());
+    }
+    validate_owner_and_mode(&metadata, path, label)?;
+
+    #[cfg(unix)]
+    if !insecure_dirs_allowed()? && metadata.permissions().mode() & 0o777 != 0o700 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restrict {label} {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn reject_symlink_components(path: &Path, label: &str) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = fs::symlink_metadata(&current) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            bail!("{label} contains a symlink: {}", current.display());
+        }
+    }
+    Ok(())
+}
+
+fn validate_owner_and_mode(metadata: &fs::Metadata, path: &Path, label: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let expected_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != expected_uid {
+            bail!(
+                "{label} is not owned by the current user: {}",
+                path.display()
+            );
+        }
+        if metadata.permissions().mode() & 0o022 != 0 && !insecure_dirs_allowed()? {
+            bail!(
+                "{label} is writable by another user; set TERRENCE_AGENT_ALLOW_INSECURE_DIRS=true to override: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn insecure_dirs_allowed() -> Result<bool> {
+    parse_bool(
+        env_value(&[
+            "TERRENCE_AGENT_ALLOW_INSECURE_DIRS",
+            "TERRENCE_AGENT_ALLOW_INSECURE_DATA_DIR",
+        ])
+        .as_deref(),
+        false,
+    )
+}
+
+/// Validate an executable's owner and permissions before running it.
+pub(crate) fn validate_secure_executable(
+    path: &Path,
+    label: &str,
+    reject_symlink: bool,
+) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("{label} path must be absolute: {}", path.display());
+    }
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if reject_symlink && metadata.file_type().is_symlink() {
+        bail!("{label} must not be a symlink: {}", path.display());
+    }
+    let canonical =
+        fs::canonicalize(path).with_context(|| format!("resolve {label} {}", path.display()))?;
+    let metadata = fs::symlink_metadata(&canonical)
+        .with_context(|| format!("inspect resolved {label} {}", canonical.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("{label} is not a file: {}", canonical.display());
+    }
+    #[cfg(unix)]
+    {
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!("{label} is not executable: {}", canonical.display());
+        }
+        let expected_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != expected_uid && metadata.uid() != 0 {
+            bail!(
+                "{label} is not owned by the current user: {}",
+                canonical.display()
+            );
+        }
+        if metadata.permissions().mode() & 0o022 != 0 {
+            bail!(
+                "{label} is writable by another user: {}",
+                canonical.display()
+            );
+        }
+    }
+    Ok(canonical)
+}
+
+pub(crate) fn validate_existing_private_file(path: &Path, label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {label} {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("{label} must not be a symlink: {}", path.display());
+    }
+    if !metadata.file_type().is_file() {
+        bail!("{label} is not a file: {}", path.display());
+    }
+    #[cfg(unix)]
+    {
+        let expected_uid = unsafe { libc::geteuid() };
+        if metadata.uid() != expected_uid && metadata.uid() != 0 {
+            bail!(
+                "{label} is not owned by the current user: {}",
+                path.display()
+            );
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("{label} is not private: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_loader_variable(key: &str) -> bool {
+    key.starts_with("LD_")
+        || key.starts_with("DYLD_")
+        || key.starts_with("MALLOC_")
+        || matches!(key, "GLIBC_TUNABLES" | "GCONV_PATH" | "LOCPATH")
+}
+
+pub(crate) fn validate_environment_entry(key: &str, value: &str) -> Result<()> {
+    const MAX_KEY_BYTES: usize = 256;
+    const MAX_VALUE_BYTES: usize = 64 * 1024;
+    if key.is_empty()
+        || key.len() > MAX_KEY_BYTES
+        || !key.bytes().enumerate().all(|(index, byte)| {
+            (index == 0 && (byte == b'_' || byte.is_ascii_alphabetic()))
+                || (index > 0 && (byte == b'_' || byte.is_ascii_alphanumeric()))
+        })
+    {
+        bail!("invalid job environment key");
+    }
+    if value.len() > MAX_VALUE_BYTES || value.as_bytes().contains(&0) {
+        bail!("job environment value for {key} is invalid or too large");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +840,72 @@ mod tests {
         unsafe {
             std::env::remove_var("TERRENCE_AGENT_TOKEN");
         }
+    }
+
+    #[test]
+    fn validates_job_environment_keys_and_loader_names() {
+        assert!(validate_environment_entry("TF_VAR_region", "eu-west-2").is_ok());
+        assert!(validate_environment_entry("BAD=KEY", "value").is_err());
+        assert!(validate_environment_entry("1BAD", "value").is_err());
+        assert!(is_loader_variable("LD_PRELOAD"));
+        assert!(is_loader_variable("DYLD_INSERT_LIBRARIES"));
+        assert!(is_loader_variable("MALLOC_ARENA_MAX"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_is_created_and_symlinks_are_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private").join("nested");
+        ensure_private_dir(&private, "test directory").unwrap();
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let target = root.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(ensure_private_dir(&link, "test directory").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_writable_directory_requires_explicit_override() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("shared");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_ALLOW_INSECURE_DIRS");
+        }
+        assert!(ensure_private_dir(&path, "test directory").is_err());
+        unsafe {
+            std::env::set_var("TERRENCE_AGENT_ALLOW_INSECURE_DIRS", "true");
+        }
+        assert!(ensure_private_dir(&path, "test directory").is_ok());
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_ALLOW_INSECURE_DIRS");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_must_not_be_writable_by_another_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("terraform");
+        fs::write(&path, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_secure_executable(&path, "test binary", false).is_ok());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(validate_secure_executable(&path, "test binary", false).is_err());
     }
 }

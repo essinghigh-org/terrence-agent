@@ -32,18 +32,20 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    config::set_restrictive_umask();
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if diagnostics::is_command(&args) {
         return diagnostics::run(&args).await;
     }
     let config = Config::from_env()?;
+    config::maybe_disable_core_dumps()?;
     init_logging(&config.log_level, config.log_json);
     if let Some(cache) = provider_cache::ProviderCache::from_env()? {
         info!(path = %cache.path().display(), "verified immutable provider cache");
     }
-    tokio::fs::create_dir_all(&config.data_dir)
-        .await
-        .with_context(|| format!("create data directory {}", config.data_dir.display()))?;
+    config::ensure_private_dir(&config.data_dir, "data directory")?;
+    config::ensure_private_dir(&config.data_dir.join("runs"), "runs directory")?;
+    config::ensure_private_dir(&config.cache_dir, "cache directory")?;
     let journal = Journal::open(&config.data_dir)?;
 
     let client = Client::new(config.clone())?;

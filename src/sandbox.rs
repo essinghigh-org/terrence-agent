@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use tokio::process::{Child, Command};
 
-use crate::config::Config;
+use crate::config::{Config, is_loader_variable, validate_secure_executable};
 use crate::provider_cache::ProviderCache;
 
 pub struct Sandbox {
@@ -113,6 +113,8 @@ impl Sandbox {
         };
         let output = std::process::Command::new(runner)
             .arg("--probe")
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
             .output()
             .context("probe Landlock runner")?;
         if !output.status.success() {
@@ -139,11 +141,16 @@ fn configure_command(
     command
         .current_dir(cwd)
         .env_clear()
-        .envs(env.iter().map(|(key, value)| (key, value)))
+        .envs(
+            env.iter()
+                .filter(|(key, _)| !is_loader_variable(key))
+                .map(|(key, value)| (key, value)),
+        )
         .env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
         .env("HOME", work_dir)
         .env("TMPDIR", tmp_dir)
         .env("TF_IN_AUTOMATION", "1")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
@@ -154,20 +161,7 @@ fn configure_command(
 }
 
 fn usable_runner(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    validate_secure_executable(path, "Landlock runner", false).is_ok()
 }
 
 fn system_rule_paths() -> Vec<PathBuf> {
@@ -216,6 +210,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, SecretString};
     use std::time::Duration;
+    use tempfile::tempdir;
 
     #[test]
     fn discovers_no_runner_without_installation() {
@@ -259,5 +254,23 @@ mod tests {
         terminate_child(&mut child).await;
 
         assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn command_stdin_is_not_inherited() {
+        let work = tempdir().unwrap();
+        let sandbox = Sandbox { runner: None };
+        let mut command = sandbox
+            .plain_command(
+                Path::new("/bin/cat"),
+                &[],
+                work.path(),
+                work.path(),
+                &[("LD_PRELOAD".to_owned(), "/tmp/inject.so".to_owned())],
+            )
+            .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
     }
 }

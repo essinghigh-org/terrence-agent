@@ -50,6 +50,8 @@ for an unsupported IaC binary.
 | `TERRENCE_AGENT_TERRAFORM` | PATH lookup | Explicit Terraform binary |
 | `TERRENCE_AGENT_TOFU` | PATH lookup | Explicit OpenTofu binary |
 | `TERRENCE_LANDLOCK_RUNNER` | image helper | Explicit Landlock helper |
+| `TERRENCE_AGENT_ALLOW_INSECURE_DIRS` | `false` | Explicitly allow group/world-writable data paths |
+| `TERRENCE_AGENT_NO_CORE_DUMPS` | `false` | Disable core dumps for this process |
 
 `TFC_ADDRESS`, `TFC_AGENT_TOKEN`, `TFC_AGENT_NAME`, `TFC_AGENT_DATA_DIR`,
 `TFC_AGENT_SINGLE`, and `TFC_AGENT_LOG_LEVEL` are accepted as legacy
@@ -59,6 +61,12 @@ Terrence's protocol.
 Never put the token in a command line or a checked-in manifest. Mount it as a
 0600/0440 file and set `TERRENCE_AGENT_TOKEN_FILE`; the file is read at startup
 and its contents are never included in logs or support bundles.
+
+The data directory, runs, cache, and per-run secrets are created with private
+permissions and should live on encrypted storage. Prefer an ephemeral volume
+for short-lived agents so plans, state, and credentials disappear with the
+agent. Set `TERRENCE_AGENT_ALLOW_INSECURE_DIRS=true` only for an isolated host
+where shared storage is intentional.
 
 ## Diagnostics
 

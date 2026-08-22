@@ -21,7 +21,10 @@ use tracing::warn;
 
 use crate::archive::{extract_tar_gz, flatten_single_directory, pack_tar_gz};
 use crate::client::Client;
-use crate::config::Config;
+use crate::config::{
+    Config, ensure_private_dir, is_loader_variable, validate_environment_entry,
+    validate_existing_private_file, validate_secure_executable,
+};
 use crate::manifest::ExecutionManifest;
 use crate::observability::Metrics;
 use crate::protocol::{
@@ -189,9 +192,8 @@ impl Runner {
     async fn run_inner(&self, payload: &AgentJobPayload, work_dir: &Path) -> Result<RunResult> {
         validate_payload_identifiers(payload)?;
         let container = payload.container()?;
-        fs::create_dir_all(work_dir.join("tmp"))?;
-        set_private_permissions(work_dir)?;
-        set_private_permissions(&work_dir.join("tmp"))?;
+        ensure_private_dir(work_dir, "run directory")?;
+        ensure_private_dir(&work_dir.join("tmp"), "run temporary directory")?;
 
         let exec_dir = working_directory(work_dir, &payload.data.working_directory)?;
         self.metrics
@@ -235,6 +237,7 @@ impl Runner {
             "tofu" => "tofu",
             value => bail!("unsupported IaC binary requested by Terrence: {value}"),
         };
+        let environment = execution_environment(payload, container, work_dir, self.config.sandbox)?;
         let binary = self
             .resolve_binary(binary_name, &payload.data, container)
             .await?;
@@ -250,7 +253,6 @@ impl Runner {
                 )
                 .await;
         }
-        let environment = execution_environment(payload, container, work_dir, self.config.sandbox)?;
         let log_stream =
             LogStream::new(self.client.clone(), payload.data.terraform_log_url.clone());
         let heartbeat = self.start_heartbeat();
@@ -932,6 +934,9 @@ impl Runner {
                 .into_iter()
                 .find(|path| path.is_file())
             });
+        let installed = installed
+            .map(|path| validate_secure_executable(&path, "IaC binary", false))
+            .transpose()?;
         self.toolchain
             .resolve(
                 &self.client,
@@ -1180,12 +1185,31 @@ fn execution_environment(
     work_dir: &Path,
     sandbox_enabled: bool,
 ) -> Result<Vec<(String, String)>> {
-    let mut env = payload
-        .data
-        .environment
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<HashMap<_, _>>();
+    const MAX_JOB_ENV_VARS: usize = 256;
+    const MAX_TOTAL_ENV_VARS: usize = MAX_JOB_ENV_VARS + 4;
+    const MAX_ENV_BYTES: usize = 512 * 1024;
+
+    if payload.data.environment.len() > MAX_JOB_ENV_VARS {
+        bail!("job environment contains too many variables");
+    }
+    let mut env = HashMap::new();
+    for (key, value) in &payload.data.environment {
+        validate_environment_entry(key, value)?;
+        if is_loader_variable(key)
+            || matches!(
+                key.as_str(),
+                "PATH"
+                    | "HOME"
+                    | "TMPDIR"
+                    | "TF_CLI_CONFIG_FILE"
+                    | "TF_IN_AUTOMATION"
+                    | "TERRENCE_ADDRESS"
+            )
+        {
+            continue;
+        }
+        env.insert(key.clone(), value.clone());
+    }
     env.insert(
         "TF_CLI_CONFIG_FILE".to_owned(),
         work_dir
@@ -1194,6 +1218,7 @@ fn execution_environment(
             .to_string(),
     );
     if let Some(api_address) = &container.api_address {
+        validate_environment_entry("TERRENCE_ADDRESS", api_address)?;
         env.entry("TERRENCE_ADDRESS".to_owned())
             .or_insert_with(|| api_address.clone());
     }
@@ -1207,6 +1232,20 @@ fn execution_environment(
     }
     let mut values = env.into_iter().collect::<Vec<_>>();
     values.sort_by(|left, right| left.0.cmp(&right.0));
+    let total_bytes = values
+        .iter()
+        .map(|(key, value)| key.len() + 1 + value.len() + 1)
+        .sum::<usize>();
+    if values.len() > MAX_TOTAL_ENV_VARS || total_bytes > MAX_ENV_BYTES {
+        bail!("job environment exceeds the configured size limit");
+    }
+    #[cfg(unix)]
+    {
+        let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+        if arg_max > 0 && total_bytes.saturating_add(8 * 1024) > arg_max as usize {
+            bail!("job environment exceeds the host ARG_MAX limit");
+        }
+    }
     Ok(values)
 }
 
@@ -1238,15 +1277,25 @@ fn run_token<'a>(payload: &'a AgentJobPayload, container: &'a JobContainer) -> &
 
 fn write_cli_config(work_dir: &Path, hostname: String, token: &str) -> Result<()> {
     let secrets = work_dir.join("secrets");
-    fs::create_dir_all(&secrets)?;
-    set_private_permissions(&secrets)?;
+    ensure_private_dir(&secrets, "secrets directory")?;
     let path = secrets.join("terraform.tfrc");
+    if fs::symlink_metadata(&path).is_ok() {
+        validate_existing_private_file(&path, "Terraform CLI config")?;
+    }
     let content = format!(
         "credentials {} {{\n  token = {}\n}}\n",
         hcl_quote(&hostname),
         hcl_quote(token)
     );
-    fs::write(&path, content)?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("create Terraform CLI config {}", path.display()))?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
@@ -1415,7 +1464,9 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     for directory in std::env::split_paths(&path) {
         let candidate = directory.join(name);
         if candidate.is_file() && is_executable(&candidate) {
-            return fs::canonicalize(candidate).ok();
+            if let Ok(path) = validate_secure_executable(&candidate, "PATH IaC binary", false) {
+                return Some(path);
+            }
         }
     }
     None
@@ -1463,12 +1514,9 @@ struct RunDirectory {
 
 impl RunDirectory {
     fn create(data_dir: &Path) -> Result<Self> {
-        fs::create_dir_all(data_dir)
-            .with_context(|| format!("create data directory {}", data_dir.display()))?;
+        ensure_private_dir(data_dir, "data directory")?;
         let runs = data_dir.join("runs");
-        fs::create_dir_all(&runs)
-            .with_context(|| format!("create run directory {}", runs.display()))?;
-        set_private_permissions(&runs)?;
+        ensure_private_dir(&runs, "runs directory")?;
         let root = fs::canonicalize(&runs)
             .with_context(|| format!("resolve run directory {}", runs.display()))?;
 
@@ -1869,6 +1917,58 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn filters_security_sensitive_job_environment() {
+        let mut payload = test_payload("job-1", "run-1");
+        payload
+            .data
+            .environment
+            .insert("TF_VAR_region".to_owned(), "eu-west-2".to_owned());
+        payload
+            .data
+            .environment
+            .insert("LD_PRELOAD".to_owned(), "/tmp/inject.so".to_owned());
+        payload
+            .data
+            .environment
+            .insert("PATH".to_owned(), "/tmp/bin".to_owned());
+        let values = execution_environment(
+            &payload,
+            payload.plan.as_ref().unwrap(),
+            Path::new("/tmp/run"),
+            false,
+        )
+        .unwrap()
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+        assert_eq!(
+            values.get("TF_VAR_region").map(String::as_str),
+            Some("eu-west-2")
+        );
+        assert!(!values.contains_key("LD_PRELOAD"));
+        assert!(!values.contains_key("PATH"));
+    }
+
+    #[test]
+    fn rejects_oversized_job_environment() {
+        let mut payload = test_payload("job-1", "run-1");
+        for index in 0..257 {
+            payload
+                .data
+                .environment
+                .insert(format!("TF_VAR_{index}"), "value".to_owned());
+        }
+        assert!(
+            execution_environment(
+                &payload,
+                payload.plan.as_ref().unwrap(),
+                Path::new("/tmp/run"),
+                false,
+            )
+            .is_err()
         );
     }
 
