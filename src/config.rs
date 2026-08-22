@@ -152,11 +152,17 @@ impl Config {
         }
         let max_parallelism = max_parallelism.min(HARD_MAX_PARALLELISM) as u32;
         let terraform_path = env_value(&["TERRENCE_AGENT_TERRAFORM"]).map(PathBuf::from);
-        if terraform_path.as_deref().is_some_and(|path| !is_executable(path)) {
+        if terraform_path
+            .as_deref()
+            .is_some_and(|path| !is_executable(path))
+        {
             bail!("TERRENCE_AGENT_TERRAFORM must point to an executable absolute path");
         }
         let tofu_path = env_value(&["TERRENCE_AGENT_TOFU"]).map(PathBuf::from);
-        if tofu_path.as_deref().is_some_and(|path| !is_executable(path)) {
+        if tofu_path
+            .as_deref()
+            .is_some_and(|path| !is_executable(path))
+        {
             bail!("TERRENCE_AGENT_TOFU must point to an executable absolute path");
         }
 
