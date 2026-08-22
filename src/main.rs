@@ -1,6 +1,7 @@
 mod archive;
 mod client;
 mod config;
+mod diagnostics;
 mod protocol;
 mod runner;
 mod sandbox;
@@ -21,6 +22,10 @@ use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if diagnostics::is_command(&args) {
+        return diagnostics::run(&args).await;
+    }
     let config = Config::from_env()?;
     init_logging(&config.log_level, config.log_json);
     tokio::fs::create_dir_all(&config.data_dir)

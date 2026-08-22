@@ -82,7 +82,6 @@ impl Config {
                 })?
             }
         };
-
         let data_dir = env_value(&["TERRENCE_AGENT_DATA_DIR", "TFC_AGENT_DATA_DIR"])
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir().join(".terrence-agent"));
@@ -284,6 +283,24 @@ mod tests {
             std::env::remove_var("TERRENCE_AGENT_CACHE_DIR");
             std::env::remove_var("TERRENCE_AGENT_DATA_DIR");
             std::env::remove_var("TERRENCE_AGENT_TOKEN");
+        }
+    }
+
+    #[test]
+    fn token_file_is_accepted_when_environment_token_is_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let token_path = temp.path().join("agent-token");
+        std::fs::write(&token_path, "file-token\n").unwrap();
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_TOKEN");
+            std::env::remove_var("TFC_AGENT_TOKEN");
+            std::env::set_var("TERRENCE_AGENT_TOKEN_FILE", &token_path);
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.token, "file-token");
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_TOKEN_FILE");
         }
     }
 

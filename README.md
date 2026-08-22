@@ -37,6 +37,7 @@ for an unsupported IaC binary.
 |---|---|---|
 | `TERRENCE_ADDRESS` | `https://terraform.example.com` | Terrence API base URL |
 | `TERRENCE_AGENT_TOKEN` | required | Agent pool token |
+| `TERRENCE_AGENT_TOKEN_FILE` | unset | Read the agent token from a file (recommended for Secret/credential mounts) |
 | `TERRENCE_AGENT_NAME` | hostname | Registered agent name |
 | `TERRENCE_AGENT_DATA_DIR` | `~/.terrence-agent` | Run and binary cache |
 | `TERRENCE_AGENT_CACHE_DIR` | `<data_dir>/cache` | IaC binary cache (separate from run data) |
@@ -53,6 +54,31 @@ for an unsupported IaC binary.
 `TFC_AGENT_SINGLE`, and `TFC_AGENT_LOG_LEVEL` are accepted as legacy
 compatibility aliases for migration convenience. The wire protocol remains
 Terrence's protocol.
+
+Never put the token in a command line or a checked-in manifest. Mount it as a
+0600/0440 file and set `TERRENCE_AGENT_TOKEN_FILE`; the file is read at startup
+and its contents are never included in logs or support bundles.
+
+## Diagnostics
+
+The binary has local, offline-friendly checks for deployment support:
+
+```sh
+terrence-agent --version
+terrence-agent check-config
+terrence-agent probe-sandbox
+terrence-agent list-capabilities
+terrence-agent cache verify
+terrence-agent cache prune       # removes only incomplete cache entries
+terrence-agent connectivity-test
+terrence-agent doctor --offline
+terrence-agent doctor --support-bundle /tmp/terrence-agent-doctor.json
+```
+
+`doctor` reports configuration, Landlock, cgroup v2, disk/inode, IaC binary,
+DNS, and control-plane checks. It never prints token or environment values.
+Use `--offline` when the control plane is intentionally unreachable. The
+support bundle is JSON with mode `0600` and contains only redacted settings.
 
 ## Job lifecycle
 
@@ -83,6 +109,47 @@ with appropriate CPU, memory, PID, and network limits for the workload.
 
 Set `TERRENCE_AGENT_SANDBOX=false` only when the host does not support
 Landlock and the execution environment supplies an equivalent boundary.
+
+## Kubernetes
+
+`deploy/kubernetes/terrence-agent.yaml` is a hardened Deployment example. It
+runs as UID/GID `65532`, drops all Linux capabilities, uses the RuntimeDefault
+seccomp profile, keeps the image root filesystem read-only, mounts run data on
+an ephemeral volume, and mounts the binary cache on a PVC. Readiness and
+liveness execute `check-config`; the PDB and topology spread rules keep an
+agent pool available during maintenance.
+
+Create the token Secret out of band, then apply the example:
+
+```sh
+kubectl -n terrence create secret generic terrence-agent-token \
+  --from-file=token=/path/to/agent-token
+kubectl -n terrence apply -f deploy/kubernetes/terrence-agent.yaml
+```
+
+The example uses an RWX-capable PVC for two replicas. If the cluster only
+provides RWO storage, use one replica per cache claim (or set `replicas: 1`)
+instead of sharing a claim between pods.
+
+## systemd
+
+`deploy/systemd/terrence-agent.service` uses `DynamicUser`, private state and
+cache directories, `ProtectSystem=strict`, `NoNewPrivileges`, resource limits,
+and `LoadCredential=` for the token. Install the unit and create the root-only
+credential file at `/etc/terrence-agent/agent-token`, then enable it:
+
+```sh
+sudo install -m 0644 deploy/systemd/terrence-agent.service \
+  /etc/systemd/system/terrence-agent.service
+sudo install -d -m 0700 /etc/terrence-agent
+sudo install -m 0600 ./agent-token /etc/terrence-agent/agent-token
+sudo systemctl daemon-reload
+sudo systemctl enable --now terrence-agent.service
+```
+
+Review `RestrictAddressFamilies` and `SystemCallFilter` against the providers
+you run; the unit intentionally leaves common Terraform provider syscalls
+available while blocking unrelated kernel-control groups.
 
 ## Development
 
