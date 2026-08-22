@@ -111,6 +111,7 @@ mod tests {
                 terraform_checksum: String::new(),
                 terraform_log_url: "/log".to_owned(),
                 json_plan_url: "/plan".to_owned(),
+                state_artifact_url: None,
                 token: "secret-is-hashed-not-stored".to_owned(),
                 timeout: "1h".to_owned(),
                 environment,

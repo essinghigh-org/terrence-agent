@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     net::IpAddr,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -14,6 +15,7 @@ use reqwest::{RequestBuilder, StatusCode, header, redirect::Policy};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -66,6 +68,12 @@ pub enum ClientError {
     Dns { host: String, reason: String },
     #[error("transport failed for {path}: {reason}")]
     Transport { path: String, reason: String },
+    #[error("failed to read artifact {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Clone)]
@@ -341,6 +349,40 @@ impl Client {
             .put(artifact.as_url().clone())
             .header("content-type", content_type)
             .body(bytes);
+        self.send_empty(request, &path).await
+    }
+
+    /// Upload a file without buffering the complete artifact in memory.
+    pub async fn put_artifact_file(
+        &self,
+        url: &str,
+        file_path: &Path,
+        content_type: &str,
+    ) -> Result<(), ClientError> {
+        let artifact = self.resolve_url(url)?;
+        let address = self.validate_artifact_url(&artifact).await?;
+        let path = url_label_url(artifact.as_url());
+        let file = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|source| ClientError::Io {
+                path: file_path.display().to_string(),
+                source,
+            })?;
+        let stream = futures_util::stream::try_unfold(file, |mut file| async move {
+            let mut chunk = vec![0_u8; 64 * 1024];
+            let read = file.read(&mut chunk).await?;
+            if read == 0 {
+                Ok::<_, std::io::Error>(None)
+            } else {
+                chunk.truncate(read);
+                Ok(Some((chunk, file)))
+            }
+        });
+        let request = self
+            .artifact_http_for(&artifact, address)?
+            .put(artifact.as_url().clone())
+            .header("content-type", content_type)
+            .body(reqwest::Body::wrap_stream(stream));
         self.send_empty(request, &path).await
     }
 
@@ -1143,6 +1185,14 @@ mod tests {
                         json_state: None,
                         json_state_outputs: None,
                         provenance_digest: None,
+                        state_recovered: false,
+                        state_recovery_required: false,
+                        apply_error: None,
+                        state_recovery_error: None,
+                        lifecycle: None,
+                        state_digest: None,
+                        state_bytes: None,
+                        state_artifact: None,
                     },
                 }),
             )

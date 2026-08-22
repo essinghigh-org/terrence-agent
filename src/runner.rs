@@ -1,13 +1,19 @@
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{BufReader, Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use reqwest::Url;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -20,7 +26,7 @@ use crate::manifest::ExecutionManifest;
 use crate::observability::Metrics;
 use crate::protocol::{
     AgentJobPayload, CompletionData, CompletionJob, JobContainer, JobData, Phase, PlanCounts,
-    state_outputs,
+    StateArtifact, state_outputs,
 };
 use crate::provenance::{
     AgentMetadata, ExecutionManifest as ProvenanceManifest, SandboxMetadata, ToolMetadata,
@@ -35,6 +41,11 @@ const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(750);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STATE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_INLINE_STATE_BYTES: u64 = 8 * 1024 * 1024;
+const APPLY_EXECUTION_MARKER: &str = ".terrence-apply-execution-finished";
+const STATE_FILE: &str = "terraform.tfstate";
+const STATE_ARTIFACT_FILE: &str = ".terrence-state.json.gz";
 
 pub struct Runner {
     client: Client,
@@ -143,6 +154,15 @@ impl Runner {
                             json_state: None,
                             json_state_outputs: None,
                             provenance_digest: None,
+                            state_recovered: false,
+                            state_recovery_required: payload.phase == Phase::Apply,
+                            apply_error: None,
+                            state_recovery_error: None,
+                            lifecycle: (payload.phase == Phase::Apply)
+                                .then(|| "applied_state_recovery_required".to_owned()),
+                            state_digest: None,
+                            state_bytes: None,
+                            state_artifact: None,
                         },
                     },
                     work_dir,
@@ -567,6 +587,13 @@ impl Runner {
                     json_state: None,
                     json_state_outputs: None,
                     provenance_digest: Some(provenance_digest),
+                    apply_error: None,
+                    state_recovered: false,
+                    state_recovery_required: false,
+                    state_recovery_error: None,
+                    state_digest: None,
+                    state_bytes: None,
+                    state_artifact: None,
                 })
             }
             Phase::Apply => {
@@ -603,21 +630,35 @@ impl Runner {
                     environment,
                     plan_manifest,
                 )?;
-                let apply_status = self
-                    .run_streamed(
-                        binary,
-                        &apply_args,
-                        exec_dir,
-                        work_dir,
-                        environment,
-                        &log_writer,
-                        &payload.data.timeout,
-                    )
-                    .await
-                    .context("run terraform apply")?;
-                if !apply_status {
-                    bail!("terraform apply failed");
-                }
+                let marker = work_dir.join(APPLY_EXECUTION_MARKER);
+                let apply_error = if marker.is_file() {
+                    read_apply_error(&marker)
+                } else {
+                    let result = self
+                        .run_streamed(
+                            binary,
+                            &apply_args,
+                            exec_dir,
+                            work_dir,
+                            environment,
+                            &log_writer,
+                            &payload.data.timeout,
+                        )
+                        .await;
+                    let apply_error = match result {
+                        Ok(true) => None,
+                        Ok(false) => Some("terraform apply failed".to_owned()),
+                        Err(error) => Some(format_error(&error)),
+                    };
+                    if let Err(error) = persist_apply_marker(&marker, apply_error.as_deref()) {
+                        warn!(
+                            path = %marker.display(),
+                            error = %error,
+                            "failed to persist apply execution marker"
+                        );
+                    }
+                    apply_error
+                };
                 self.metrics
                     .stage_event(
                         "apply.execution_finished",
@@ -625,46 +666,122 @@ impl Runner {
                         payload.phase.as_str(),
                     )
                     .await;
-                let state = match self
-                    .capture_json(
+
+                // State recovery is deliberately attempted regardless of the
+                // apply exit status. Providers may commit resources before a
+                // later operation fails.
+                let state_path = exec_dir.join(STATE_FILE);
+                let state_capture = self
+                    .capture_state_file(
                         binary,
                         &["state", "pull"],
                         exec_dir,
                         work_dir,
                         environment,
                         &payload.data.timeout,
+                        &state_path,
                     )
                     .await
-                {
-                    Ok(state) => {
-                        self.metrics
-                            .stage_event(
-                                "state.recovered",
-                                &payload.data.run_id,
-                                payload.phase.as_str(),
-                            )
-                            .await;
-                        Some(state)
-                    }
-                    Err(error) => {
-                        warn!(error = %error, "terraform state pull failed after apply");
-                        None
-                    }
-                };
-                let (state_text, json_state, json_state_outputs) = match state {
-                    Some(state) => {
-                        let serialized = state.to_string();
-                        (
-                            Some(serialized.clone()),
-                            Some(serialized),
-                            Some(state_outputs(&state)),
+                    .unwrap_or_else(|error| StateCapture {
+                        command_error: Some(format_error(&error)),
+                        bytes: fs::metadata(&state_path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0),
+                    });
+                let state_recovered =
+                    state_capture.bytes > 0 && validate_state_file(&state_path).is_ok();
+                let state_recovery_error = state_capture.command_error.clone();
+                if state_recovered {
+                    self.metrics
+                        .stage_event(
+                            "state.recovered",
+                            &payload.data.run_id,
+                            payload.phase.as_str(),
                         )
+                        .await;
+                }
+
+                let mut state_digest = None;
+                let mut state_bytes = None;
+                let mut state_artifact = None;
+                let mut state_text = None;
+                let json_state = None;
+                let mut json_state_outputs = None;
+                let mut state_commit_error = None;
+
+                if state_recovered {
+                    match persist_state_artifact(&state_path, &work_dir.join(STATE_ARTIFACT_FILE)) {
+                        Ok(metadata) => {
+                            state_digest = Some(metadata.raw_digest);
+                            state_bytes = Some(metadata.raw_bytes);
+                            let state_artifact_url = payload
+                                .data
+                                .state_artifact_url
+                                .as_deref()
+                                .or(container.state_artifact_url.as_deref())
+                                .filter(|url| !url.is_empty());
+                            if let Some(url) = state_artifact_url {
+                                match self
+                                    .client
+                                    .put_artifact_file(
+                                        url,
+                                        &work_dir.join(STATE_ARTIFACT_FILE),
+                                        "application/gzip",
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        state_artifact = Some(StateArtifact {
+                                            // Signed query parameters are bearer
+                                            // credentials; only expose the path.
+                                            reference: artifact_reference(url),
+                                            digest: metadata.artifact_digest,
+                                            bytes: metadata.artifact_bytes,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        state_commit_error = Some(format_error(&anyhow!(error)));
+                                    }
+                                }
+                            } else if metadata.raw_bytes <= MAX_INLINE_STATE_BYTES {
+                                match read_inline_state(&state_path) {
+                                    Ok((state, outputs)) => {
+                                        state_text = Some(state);
+                                        json_state_outputs = Some(outputs);
+                                    }
+                                    Err(error) => state_commit_error = Some(format_error(&error)),
+                                }
+                            } else {
+                                state_commit_error = Some(format!(
+                                    "state is {} bytes and this server did not provide a dedicated state artifact endpoint",
+                                    metadata.raw_bytes
+                                ));
+                            }
+                        }
+                        Err(error) => state_commit_error = Some(format_error(&error)),
                     }
-                    None => (None, None, None),
-                };
+                }
+
+                let state_recovery_required = !state_recovered
+                    || state_recovery_error.is_some()
+                    || state_commit_error.is_some();
+                let state_recovery_error = state_commit_error.or(state_recovery_error);
+                if state_recovery_required {
+                    self.metrics
+                        .stage_event(
+                            "state.recovery_required",
+                            &payload.data.run_id,
+                            payload.phase.as_str(),
+                        )
+                        .await;
+                }
                 let mut manifest = plan_manifest.clone();
                 manifest.phase = "apply".to_owned();
-                manifest.status = "finished".to_owned();
+                manifest.status = if apply_error.is_some() || state_recovery_required {
+                    "errored".to_owned()
+                } else {
+                    "finished".to_owned()
+                };
                 manifest.agent = self.agent_metadata();
                 manifest.tool = self.tool_metadata(
                     payload.data.iac_binary.as_deref().unwrap_or("terraform"),
@@ -673,18 +790,24 @@ impl Runner {
                 )?;
                 manifest.cli_args = apply_args;
                 manifest.sandbox = self.sandbox_metadata();
-                manifest.output_state_digest =
-                    state_text.as_deref().map(str::as_bytes).map(bytes_digest);
+                manifest.output_state_digest = state_digest.clone();
                 manifest.source_manifest_digest = preparation.manifest_digest.clone();
                 manifest.started_at = now_unix_seconds();
                 manifest.completed_at = now_unix_seconds();
                 let provenance_digest = persist(&manifest, work_dir)?;
                 Ok(RunResult {
                     counts,
+                    apply_error,
+                    state_recovered,
+                    state_recovery_required,
+                    state_recovery_error,
                     state: state_text,
                     json_state,
                     json_state_outputs,
                     provenance_digest: Some(provenance_digest),
+                    state_digest,
+                    state_bytes,
+                    state_artifact,
                 })
             }
         }
@@ -855,6 +978,85 @@ impl Runner {
         Ok(status.success())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn capture_state_file(
+        &self,
+        binary: &Path,
+        args: &[&str],
+        cwd: &Path,
+        work_dir: &Path,
+        environment: &[(String, String)],
+        timeout_text: &str,
+        output_path: &Path,
+    ) -> Result<StateCapture> {
+        let owned_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let mut command = self.sandbox.choose_command(
+            &self.config,
+            binary,
+            &owned_args,
+            cwd,
+            work_dir,
+            environment,
+        )?;
+        let mut child = command.spawn().context("spawn terraform state pull")?;
+        let stdout = child.stdout.take().context("capture state stdout")?;
+        let stderr = child.stderr.take().context("capture state stderr")?;
+        let stdout_task = tokio::spawn(write_limited_file(
+            stdout,
+            output_path.to_owned(),
+            MAX_STATE_BYTES,
+        ));
+        let stderr_task = tokio::spawn(read_limited_async(stderr, 1 << 20));
+        let timeout = parse_job_timeout(timeout_text);
+        let mut command_error = None;
+        let status = match time::timeout(timeout, child.wait()).await {
+            Ok(status) => match status {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    command_error = Some(format!("wait for terraform state pull: {error}"));
+                    None
+                }
+            },
+            Err(_) => {
+                terminate_child(&mut child).await;
+                command_error = Some(format!(
+                    "terraform state pull exceeded {} seconds",
+                    timeout.as_secs()
+                ));
+                None
+            }
+        };
+        let output_result = match stdout_task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("join state stdout reader: {error}")),
+        };
+        let stderr = stderr_task.await.context("join state stderr reader")??;
+        if let Err(error) = output_result {
+            command_error = Some(format_error(&error));
+        }
+        if status.is_some_and(|status| !status.success()) {
+            let detail = String::from_utf8_lossy(&stderr).trim().to_owned();
+            command_error = Some(if detail.is_empty() {
+                format!(
+                    "terraform state pull failed with exit status {}",
+                    status.and_then(|status| status.code()).unwrap_or(-1)
+                )
+            } else {
+                format!("terraform state pull failed: {detail}")
+            });
+        }
+        if let Err(error) = fs::set_permissions(output_path, fs::Permissions::from_mode(0o600)) {
+            command_error.get_or_insert_with(|| format!("set state file permissions: {error}"));
+        }
+        let bytes = fs::metadata(output_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Ok(StateCapture {
+            command_error,
+            bytes,
+        })
+    }
+
     async fn capture_json(
         &self,
         binary: &Path,
@@ -912,12 +1114,39 @@ struct RunResult {
     json_state: Option<String>,
     json_state_outputs: Option<String>,
     provenance_digest: Option<String>,
+    apply_error: Option<String>,
+    state_recovered: bool,
+    state_recovery_required: bool,
+    state_recovery_error: Option<String>,
+    state_digest: Option<String>,
+    state_bytes: Option<u64>,
+    state_artifact: Option<StateArtifact>,
 }
 
 fn completion_from_result(payload: &AgentJobPayload, result: RunResult) -> CompletionJob {
+    let status = if payload.phase == Phase::Apply
+        && (result.apply_error.is_some() || result.state_recovery_required)
+    {
+        "errored"
+    } else {
+        "finished"
+    };
+    let lifecycle = if payload.phase != Phase::Apply {
+        None
+    } else if result.state_recovery_required {
+        Some("applied_state_recovery_required".to_owned())
+    } else if result.apply_error.is_some() {
+        Some("apply_execution_finished".to_owned())
+    } else {
+        Some("applied".to_owned())
+    };
+    let error = result
+        .apply_error
+        .clone()
+        .or_else(|| result.state_recovery_error.clone());
     CompletionJob {
-        status: "finished",
-        error: None,
+        status,
+        error,
         data: CompletionData {
             run_id: payload.data.run_id.clone(),
             operation: payload.phase.as_str().to_owned(),
@@ -933,6 +1162,14 @@ fn completion_from_result(payload: &AgentJobPayload, result: RunResult) -> Compl
             json_state: result.json_state,
             json_state_outputs: result.json_state_outputs,
             provenance_digest: result.provenance_digest,
+            state_recovered: result.state_recovered,
+            state_recovery_required: result.state_recovery_required,
+            apply_error: result.apply_error,
+            state_recovery_error: result.state_recovery_error,
+            lifecycle,
+            state_digest: result.state_digest,
+            state_bytes: result.state_bytes,
+            state_artifact: result.state_artifact,
         },
     }
 }
@@ -1027,6 +1264,117 @@ fn read_plan_metadata(work_dir: &Path) -> Option<PlanCounts> {
     serde_json::from_slice::<PlanMetadata>(&bytes)
         .ok()
         .map(|metadata| metadata.counts())
+}
+
+struct StateCapture {
+    command_error: Option<String>,
+    bytes: u64,
+}
+
+struct StateArtifactMetadata {
+    raw_digest: String,
+    raw_bytes: u64,
+    artifact_digest: String,
+    artifact_bytes: u64,
+}
+
+fn persist_apply_marker(path: &Path, apply_error: Option<&str>) -> Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create apply execution marker {}", path.display()))?;
+    if let Some(error) = apply_error {
+        file.write_all(error.as_bytes())?;
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_apply_error(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+fn persist_state_artifact(
+    state_path: &Path,
+    artifact_path: &Path,
+) -> Result<StateArtifactMetadata> {
+    let (raw_digest, raw_bytes) = digest_file(state_path)?;
+    let input = std::fs::File::open(state_path)
+        .with_context(|| format!("open persisted state {}", state_path.display()))?;
+    let output = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(artifact_path)
+        .with_context(|| format!("create state artifact {}", artifact_path.display()))?;
+    let mut encoder = GzEncoder::new(output, Compression::default());
+    std::io::copy(&mut BufReader::new(input), &mut encoder).context("compress persisted state")?;
+    let output = encoder.finish().context("finish compressed state")?;
+    output.sync_all()?;
+    let artifact_bytes = output.metadata()?.len();
+    let (artifact_digest, _) = digest_file(artifact_path)?;
+    Ok(StateArtifactMetadata {
+        raw_digest,
+        raw_bytes,
+        artifact_digest,
+        artifact_bytes,
+    })
+}
+
+fn digest_file(path: &Path) -> Result<(String, u64)> {
+    let mut input =
+        std::fs::File::open(path).with_context(|| format!("open state file {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    Ok((format!("{:x}", hasher.finalize()), bytes))
+}
+
+fn validate_state_file(path: &Path) -> Result<()> {
+    let input =
+        std::fs::File::open(path).with_context(|| format!("open state file {}", path.display()))?;
+    let mut deserializer = serde_json::Deserializer::from_reader(BufReader::new(input));
+    let _: IgnoredAny =
+        IgnoredAny::deserialize(&mut deserializer).context("parse persisted Terraform state")?;
+    deserializer.end().context("parse trailing state data")?;
+    Ok(())
+}
+
+fn read_inline_state(path: &Path) -> Result<(String, String)> {
+    let state = fs::read_to_string(path)
+        .with_context(|| format!("read persisted state {}", path.display()))?;
+    let parsed: Value = serde_json::from_str(&state).context("parse persisted Terraform state")?;
+    Ok((state, state_outputs(&parsed)))
+}
+
+fn artifact_reference(value: &str) -> String {
+    Url::parse(value)
+        .map(|url| url.path().to_owned())
+        .unwrap_or_else(|_| value.to_owned())
+}
+
+#[cfg(test)]
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn working_directory(work_dir: &Path, value: &str) -> Result<PathBuf> {
@@ -1260,6 +1608,29 @@ where
     }
 }
 
+async fn write_limited_file<R>(mut reader: R, path: PathBuf, limit: u64) -> Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = tokio::fs::File::create(&path)
+        .await
+        .with_context(|| format!("create state file {}", path.display()))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            output.sync_all().await?;
+            return Ok(total);
+        }
+        total = total.saturating_add(read as u64);
+        if total > limit {
+            bail!("command output exceeds {limit} bytes");
+        }
+        output.write_all(&buffer[..read]).await?;
+    }
+}
+
 #[derive(Clone)]
 struct LogWriter {
     sender: mpsc::Sender<String>,
@@ -1388,6 +1759,7 @@ mod tests {
     use crate::client::Client;
     use crate::config::{Config, SecretString};
     use crate::protocol::{AgentJobPayload, JobContainer, JobData};
+    use flate2::read::GzDecoder;
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -1543,6 +1915,7 @@ mod tests {
                 terraform_checksum: String::new(),
                 terraform_log_url: "/logs".to_owned(),
                 json_plan_url: "/json-plan".to_owned(),
+                state_artifact_url: None,
                 token: "token".to_owned(),
                 timeout: String::new(),
                 environment: HashMap::new(),
@@ -1567,5 +1940,37 @@ mod tests {
         assert_eq!(counts.changes, 1);
         assert_eq!(counts.destructions, 1);
         assert_eq!(counts.imports, 1);
+    }
+
+    #[test]
+    fn persists_state_as_a_gzipped_hashed_artifact() {
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join(STATE_FILE);
+        let artifact_path = temp.path().join(STATE_ARTIFACT_FILE);
+        let state = format!(
+            "{{\"version\":4,\"serial\":1,\"outputs\":{{\"value\":{{\"sensitive\":false,\"value\":\"{}\"}}}}}}",
+            "x".repeat(10 * 1024 * 1024)
+        );
+        fs::write(&state_path, &state).unwrap();
+
+        let metadata = persist_state_artifact(&state_path, &artifact_path).unwrap();
+        assert_eq!(metadata.raw_bytes, state.len() as u64);
+        assert_eq!(metadata.raw_digest, hex_digest(state.as_bytes()));
+        assert!(metadata.artifact_bytes < metadata.raw_bytes);
+        validate_state_file(&state_path).unwrap();
+
+        let compressed = fs::File::open(&artifact_path).unwrap();
+        let mut decoder = GzDecoder::new(compressed);
+        let mut restored = String::new();
+        decoder.read_to_string(&mut restored).unwrap();
+        assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn invalid_state_is_not_marked_recovered() {
+        let temp = tempdir().unwrap();
+        let state_path = temp.path().join(STATE_FILE);
+        fs::write(&state_path, b"not-json").unwrap();
+        assert!(validate_state_file(&state_path).is_err());
     }
 }

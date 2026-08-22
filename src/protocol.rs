@@ -261,6 +261,21 @@ where
         .transpose()
 }
 
+fn deserialize_optional_url_or_empty<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            validate_url(&value, false)
+                .map_err(de::Error::custom)
+                .map(|()| value)
+        })
+        .transpose()
+}
+
 fn deserialize_address_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -484,6 +499,14 @@ pub struct JobData {
     pub terraform_log_url: String,
     #[serde(deserialize_with = "deserialize_url")]
     pub json_plan_url: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_url_or_empty",
+        alias = "state_url",
+        alias = "state_upload_url",
+        alias = "state_artifact_upload_url"
+    )]
+    pub state_artifact_url: Option<String>,
     #[serde(deserialize_with = "deserialize_text")]
     pub token: String,
     #[serde(default)]
@@ -510,6 +533,14 @@ pub struct JobContainer {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_optional_url")]
     pub api_address: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_url_or_empty",
+        alias = "state_url",
+        alias = "state_upload_url",
+        alias = "state_artifact_upload_url"
+    )]
+    pub state_artifact_url: Option<String>,
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_optional_url")]
     pub agent_host_url: Option<String>,
@@ -571,6 +602,29 @@ pub struct CompletionData {
     pub json_state_outputs: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance_digest: Option<String>,
+    #[serde(default)]
+    pub state_recovered: bool,
+    #[serde(default)]
+    pub state_recovery_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_recovery_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_artifact: Option<StateArtifact>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct StateArtifact {
+    pub reference: String,
+    pub digest: String,
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -302,6 +302,14 @@ mod tests {
                 json_state: Some("{}".to_owned()),
                 json_state_outputs: Some("{}".to_owned()),
                 provenance_digest: None,
+                state_recovered: false,
+                state_recovery_required: false,
+                apply_error: None,
+                state_recovery_error: None,
+                lifecycle: None,
+                state_digest: None,
+                state_bytes: None,
+                state_artifact: None,
             },
         }
     }
