@@ -82,11 +82,24 @@ impl Runner {
     }
 
     pub async fn run(&self, payload: &AgentJobPayload) -> JobOutcome {
-        let result = self.run_inner(payload).await;
-        let work_dir = self.work_dir(payload);
-        if let Err(error) = cleanup_run_directory(&work_dir).await {
-            warn!(path = %work_dir.display(), error = %error, "failed to remove run directory");
-        }
+        let result = if let Err(error) = validate_payload_identifiers(payload) {
+            Err(error)
+        } else {
+            match RunDirectory::create(&self.config.data_dir) {
+                Ok(run_directory) => {
+                    let result = self.run_inner(payload, run_directory.path()).await;
+                    if let Err(error) = run_directory.cleanup().await {
+                        warn!(
+                            path = %run_directory.path().display(),
+                            error = %error,
+                            "failed to remove run directory"
+                        );
+                    }
+                    result
+                }
+                Err(error) => Err(error),
+            }
+        };
         match result {
             Ok(result) => JobOutcome {
                 completion: completion_from_result(payload, result),
@@ -119,26 +132,21 @@ impl Runner {
         }
     }
 
-    async fn run_inner(&self, payload: &AgentJobPayload) -> Result<RunResult> {
-        validate_identifier(&payload.job_id, "job id")?;
-        validate_identifier(&payload.data.run_id, "run id")?;
+    async fn run_inner(&self, payload: &AgentJobPayload, work_dir: &Path) -> Result<RunResult> {
+        validate_payload_identifiers(payload)?;
         let container = payload.container()?;
-        let work_dir = self.work_dir(payload);
-        fs::create_dir_all(&self.config.data_dir)
-            .with_context(|| format!("create data directory {}", self.config.data_dir.display()))?;
-        fs::create_dir_all(work_dir.parent().context("run directory has no parent")?)?;
-        remove_dir(&work_dir).await?;
-        fs::create_dir_all(&work_dir)?;
         fs::create_dir_all(work_dir.join("tmp"))?;
+        set_private_permissions(work_dir)?;
+        set_private_permissions(&work_dir.join("tmp"))?;
 
-        let exec_dir = working_directory(&work_dir, &payload.data.working_directory)?;
+        let exec_dir = working_directory(work_dir, &payload.data.working_directory)?;
         match payload.phase {
             Phase::Plan => {
-                self.prepare_plan(payload, container, &work_dir, &exec_dir)
+                self.prepare_plan(payload, container, work_dir, &exec_dir)
                     .await?
             }
             Phase::Apply => {
-                self.prepare_apply(payload, container, &work_dir, &exec_dir)
+                self.prepare_apply(payload, container, work_dir, &exec_dir)
                     .await?
             }
         }
@@ -152,7 +160,7 @@ impl Runner {
         let binary = self
             .resolve_binary(binary_name, &payload.data, container)
             .await?;
-        let environment = execution_environment(payload, container, &work_dir);
+        let environment = execution_environment(payload, container, work_dir);
         let log_stream =
             LogStream::new(self.client.clone(), payload.data.terraform_log_url.clone());
         let heartbeat = self.start_heartbeat();
@@ -160,7 +168,7 @@ impl Runner {
             .execute_phase(
                 payload,
                 container,
-                &work_dir,
+                work_dir,
                 &exec_dir,
                 &binary,
                 &environment,
@@ -173,10 +181,6 @@ impl Runner {
             warn!(error = %error, "log uploader stopped with an error");
         }
         execution
-    }
-
-    fn work_dir(&self, payload: &AgentJobPayload) -> PathBuf {
-        self.config.data_dir.join("runs").join(&payload.data.run_id)
     }
 
     fn start_heartbeat(&self) -> JoinHandle<()> {
@@ -474,10 +478,7 @@ impl Runner {
             container.terraform_version.clone()
         };
         validate_identifier(&cache_key, "Terraform cache key")?;
-        let cache_dir = self
-            .config
-            .cache_dir
-            .join(&cache_key);
+        let cache_dir = self.config.cache_dir.join(&cache_key);
         let cached = cache_dir.join("terraform");
         if cached.exists() {
             return validate_executable(&cached);
@@ -691,6 +692,7 @@ fn run_token<'a>(payload: &'a AgentJobPayload, container: &'a JobContainer) -> &
 fn write_cli_config(work_dir: &Path, hostname: String, token: &str) -> Result<()> {
     let secrets = work_dir.join("secrets");
     fs::create_dir_all(&secrets)?;
+    set_private_permissions(&secrets)?;
     let path = secrets.join("terraform.tfrc");
     let content = format!(
         "credentials {} {{\n  token = {}\n}}\n",
@@ -814,8 +816,92 @@ fn parse_job_timeout(value: &str) -> Duration {
         .unwrap_or(DEFAULT_JOB_TIMEOUT)
 }
 
-async fn cleanup_run_directory(path: &Path) -> Result<()> {
-    remove_dir(path).await
+struct RunDirectory {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl RunDirectory {
+    fn create(data_dir: &Path) -> Result<Self> {
+        fs::create_dir_all(data_dir)
+            .with_context(|| format!("create data directory {}", data_dir.display()))?;
+        let runs = data_dir.join("runs");
+        fs::create_dir_all(&runs)
+            .with_context(|| format!("create run directory {}", runs.display()))?;
+        set_private_permissions(&runs)?;
+        let root = fs::canonicalize(&runs)
+            .with_context(|| format!("resolve run directory {}", runs.display()))?;
+
+        for _ in 0..8 {
+            let path = root.join(format!("{:032x}", rand::random::<u128>()));
+            match fs::create_dir(&path) {
+                Ok(()) => {
+                    set_private_permissions(&path)?;
+                    return Ok(Self { root, path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("unable to allocate a unique local run directory")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    async fn cleanup(&self) -> Result<()> {
+        assert_cleanup_target(&self.root, &self.path)?;
+        let canonical = match fs::canonicalize(&self.path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        assert_cleanup_target(&self.root, &canonical)?;
+        if fs::symlink_metadata(&self.path)?.file_type().is_symlink() {
+            bail!(
+                "refusing to remove symlink run directory {}",
+                self.path.display()
+            );
+        }
+        remove_dir(&self.path).await
+    }
+}
+
+fn assert_cleanup_target(root: &Path, target: &Path) -> Result<()> {
+    let relative = target.strip_prefix(root).with_context(|| {
+        format!(
+            "cleanup target {} is outside {}",
+            target.display(),
+            root.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || relative.components().count() != 1
+        || !matches!(
+            relative.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        bail!(
+            "cleanup target {} is not a run directory beneath {}",
+            target.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_payload_identifiers(payload: &AgentJobPayload) -> Result<()> {
+    validate_identifier(&payload.job_id, "job id")?;
+    validate_identifier(&payload.data.run_id, "run id")?;
+    Ok(())
+}
+
+fn set_private_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("set private permissions on {}", path.display()))?;
+    Ok(())
 }
 
 async fn remove_dir(path: &Path) -> Result<()> {
@@ -988,7 +1074,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::Client;
+    use crate::config::Config;
+    use crate::protocol::{AgentJobPayload, JobContainer, JobData};
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::time::Duration;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_job_timeout() {
@@ -1003,6 +1096,144 @@ mod tests {
         assert!(validate_identifier("..", "id").is_err());
         assert!(validate_identifier("...", "id").is_err());
         assert!(validate_identifier("run-1", "id").is_ok());
+    }
+
+    #[test]
+    fn rejects_long_and_non_ascii_identifiers() {
+        assert!(validate_identifier(&"a".repeat(201), "id").is_err());
+        assert!(validate_identifier("run-😀", "id").is_err());
+    }
+
+    #[tokio::test]
+    async fn invalid_job_and_traversal_run_id_cannot_remove_victim() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(data_dir.join("runs")).unwrap();
+        let victim = temp.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), b"safe").unwrap();
+
+        let runner = test_runner(data_dir);
+        let outcome = runner
+            .run(&test_payload("../invalid-job", "../../victim"))
+            .await;
+
+        assert_eq!(outcome.completion.status, "errored");
+        assert!(victim.join("keep").exists());
+    }
+
+    #[tokio::test]
+    async fn traversal_run_id_cannot_remove_victim_with_valid_job_id() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        fs::create_dir_all(data_dir.join("runs")).unwrap();
+        let victim = temp.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), b"safe").unwrap();
+
+        let runner = test_runner(data_dir);
+        let outcome = runner.run(&test_payload("job-1", "../../victim")).await;
+
+        assert_eq!(outcome.completion.status, "errored");
+        assert!(victim.join("keep").exists());
+    }
+
+    #[tokio::test]
+    async fn run_directory_is_opaque_private_and_contained() {
+        let temp = tempdir().unwrap();
+        let run = RunDirectory::create(temp.path()).unwrap();
+        let root = fs::canonicalize(temp.path().join("runs")).unwrap();
+        assert_eq!(run.root, root);
+        assert_eq!(run.path.parent(), Some(root.as_path()));
+        assert!(
+            run.path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit())
+        );
+        assert_eq!(
+            fs::metadata(&run.path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(assert_cleanup_target(&root, temp.path().join("victim").as_path()).is_err());
+        assert!(assert_cleanup_target(&root, &root).is_err());
+        assert!(assert_cleanup_target(&root, &run.path).is_ok());
+
+        run.cleanup().await.unwrap();
+        assert!(!run.path.exists());
+    }
+
+    #[test]
+    fn cli_credentials_are_private() {
+        let temp = tempdir().unwrap();
+        let work_dir = temp.path().join("run");
+        fs::create_dir(&work_dir).unwrap();
+        write_cli_config(&work_dir, "terraform.example.com".to_owned(), "token").unwrap();
+        assert_eq!(
+            fs::metadata(work_dir.join("secrets"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(work_dir.join("secrets/terraform.tfrc"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    fn test_runner(data_dir: PathBuf) -> Runner {
+        let config = Config {
+            address: "https://example.test".to_owned(),
+            token: "token".to_owned(),
+            name: "agent".to_owned(),
+            data_dir,
+            cache_dir: PathBuf::from("/tmp/terrence-agent-test-cache"),
+            single: false,
+            sandbox: false,
+            check_interval: Duration::from_secs(1),
+            log_level: "info".to_owned(),
+            log_json: false,
+            accept: "plan,apply".to_owned(),
+            terraform_path: None,
+            tofu_path: None,
+            landlock_runner: None,
+        };
+        Runner::new(Client::new(config).unwrap())
+    }
+
+    fn test_payload(job_id: &str, run_id: &str) -> AgentJobPayload {
+        AgentJobPayload {
+            phase: Phase::Plan,
+            job_id: job_id.to_owned(),
+            data: JobData {
+                organization_name: "org".to_owned(),
+                workspace_name: "workspace".to_owned(),
+                operation: "plan".to_owned(),
+                plan_id: "plan".to_owned(),
+                run_id: run_id.to_owned(),
+                iac_binary: Some("terraform".to_owned()),
+                working_directory: String::new(),
+                configuration_version_url: "/configuration".to_owned(),
+                filesystem_url: "/filesystem".to_owned(),
+                terraform_url: String::new(),
+                terraform_checksum: String::new(),
+                terraform_log_url: "/logs".to_owned(),
+                json_plan_url: "/json-plan".to_owned(),
+                token: "token".to_owned(),
+                timeout: String::new(),
+                environment: HashMap::new(),
+            },
+            plan: Some(JobContainer::default()),
+            apply: None,
+        }
     }
 
     #[test]
