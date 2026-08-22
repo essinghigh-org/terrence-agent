@@ -39,6 +39,9 @@ for an unsupported IaC binary.
 | `TERRENCE_AGENT_TOKEN` | required | Agent pool token |
 | `TERRENCE_AGENT_TOKEN_FILE` | unset | Read the agent token from a file (recommended for Secret/credential mounts) |
 | `TERRENCE_AGENT_NAME` | hostname | Registered agent name |
+| `TERRENCE_AGENT_DISPLAY_NAME` | `TERRENCE_AGENT_NAME` | Human-readable registered name |
+| `TERRENCE_AGENT_HOSTNAME` | system hostname | Host identity reported at registration |
+| `TERRENCE_AGENT_INSTANCE_ID` | random UUID | Persistent process-instance identity |
 | `TERRENCE_AGENT_DATA_DIR` | `~/.terrence-agent` | Run and binary cache |
 | `TERRENCE_AGENT_CACHE_DIR` | `<data_dir>/cache` | IaC binary cache (separate from run data) |
 | `TERRENCE_AGENT_SINGLE` | `false` | Claim one job and exit |
@@ -60,7 +63,8 @@ Terrence's protocol.
 
 Never put the token in a command line or a checked-in manifest. Mount it as a
 0600/0440 file and set `TERRENCE_AGENT_TOKEN_FILE`; the file is read at startup
-and its contents are never included in logs or support bundles.
+and reloaded before requests so rotation does not require a restart. Its
+contents are never included in logs or support bundles.
 
 The data directory, runs, cache, and per-run secrets are created with private
 permissions and should live on encrypted storage. Prefer an ephemeral volume
