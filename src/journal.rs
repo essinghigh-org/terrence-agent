@@ -177,7 +177,12 @@ impl Journal {
         entries.sort_by(|left, right| left.manifest.job_id.cmp(&right.manifest.job_id));
         Ok(entries
             .into_iter()
-            .filter(|entry| entry.state != JournalState::CleanupDone)
+            .filter(|entry| {
+                !matches!(
+                    entry.state,
+                    JournalState::Claimed | JournalState::CleanupDone
+                )
+            })
             .collect())
     }
 
@@ -315,7 +320,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let journal = Journal::open(directory.path()).unwrap();
         let first = journal.start(manifest(directory.path())).unwrap();
+        assert!(journal.unfinished().unwrap().is_empty());
         let executing = journal.mark_executing(&first).unwrap();
+        assert_eq!(journal.unfinished().unwrap().len(), 1);
         let pending = journal
             .record_completion(
                 &executing,
