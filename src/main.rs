@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod diagnostics;
 mod journal;
+mod logs;
 mod manifest;
 mod observability;
 mod protocol;

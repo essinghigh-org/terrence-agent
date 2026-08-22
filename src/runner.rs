@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
@@ -14,7 +15,6 @@ use serde::de::IgnoredAny;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::warn;
@@ -25,6 +25,7 @@ use crate::config::{
     Config, ensure_private_dir, is_loader_variable, validate_environment_entry,
     validate_existing_private_file, validate_secure_executable,
 };
+use crate::logs::{LogStream, LogWriter};
 use crate::manifest::ExecutionManifest;
 use crate::observability::Metrics;
 use crate::protocol::{
@@ -40,9 +41,10 @@ use crate::provider_cache::ProviderCache;
 use crate::sandbox::{Sandbox, terminate_child};
 use crate::toolchain::{Product, ToolchainResolver};
 
-const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(750);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const MIN_JOB_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_JOB_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STATE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_INLINE_STATE_BYTES: u64 = 8 * 1024 * 1024;
@@ -67,6 +69,27 @@ struct Preparation {
     config_digest: Option<String>,
     manifest: Option<ProvenanceManifest>,
     manifest_digest: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct JobDeadline {
+    deadline: Instant,
+}
+
+impl JobDeadline {
+    fn parse(timeout_text: &str) -> Result<Self> {
+        let timeout = parse_job_timeout(timeout_text)?;
+        Ok(Self {
+            deadline: Instant::now() + timeout,
+        })
+    }
+
+    fn remaining(self, stage: &str) -> Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow!("job execution deadline exceeded during {stage}"))
+    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -118,6 +141,23 @@ impl Runner {
         }
     }
 
+    async fn await_deadline<T, E, F>(
+        &self,
+        deadline: JobDeadline,
+        stage: &str,
+        future: F,
+    ) -> Result<T>
+    where
+        E: Into<anyhow::Error> + Send + 'static,
+        F: Future<Output = std::result::Result<T, E>>,
+    {
+        let remaining = deadline.remaining(stage)?;
+        match time::timeout(remaining, future).await {
+            Ok(result) => result.map_err(Into::into),
+            Err(_) => bail!("job execution deadline exceeded during {stage}"),
+        }
+    }
+
     pub async fn run(&self, payload: &AgentJobPayload) -> JobOutcome {
         let (result, work_dir) = if let Some(workload) = payload.phase.unsupported() {
             (Err(anyhow!("unsupported_workload: {workload}")), None)
@@ -159,6 +199,7 @@ impl Runner {
                             json_state: None,
                             json_state_outputs: None,
                             provenance_digest: None,
+                            log_incomplete: None,
                             state_recovered: false,
                             state_recovery_required: payload.phase == Phase::Apply,
                             apply_error: None,
@@ -193,6 +234,9 @@ impl Runner {
 
     async fn run_inner(&self, payload: &AgentJobPayload, work_dir: &Path) -> Result<RunResult> {
         validate_payload_identifiers(payload)?;
+        // Parse once so all stages share one monotonic execution deadline.
+        // Completion/log delivery remains outside this TTL.
+        let deadline = JobDeadline::parse(&payload.data.timeout)?;
         let container = payload.container()?;
         ensure_private_dir(work_dir, "run directory")?;
         ensure_private_dir(&work_dir.join("tmp"), "run temporary directory")?;
@@ -208,7 +252,7 @@ impl Runner {
         let preparation = match &payload.phase {
             Phase::Plan => Preparation {
                 config_digest: Some(
-                    self.prepare_plan(payload, container, work_dir, &exec_dir)
+                    self.prepare_plan(payload, container, work_dir, &exec_dir, deadline)
                         .await?,
                 ),
                 manifest: None,
@@ -216,7 +260,7 @@ impl Runner {
             },
             Phase::Apply => {
                 let (manifest, manifest_digest) = self
-                    .prepare_apply(payload, container, work_dir, &exec_dir)
+                    .prepare_apply(payload, container, work_dir, &exec_dir, deadline)
                     .await?;
                 Preparation {
                     config_digest: None,
@@ -242,7 +286,7 @@ impl Runner {
         };
         let environment = execution_environment(payload, container, work_dir, self.config.sandbox)?;
         let binary = self
-            .resolve_binary(binary_name, &payload.data, container)
+            .resolve_binary(binary_name, &payload.data, container, deadline)
             .await?;
         self.metrics
             .stage_event("tool.resolve", &payload.data.run_id, payload.phase.as_str())
@@ -256,10 +300,16 @@ impl Runner {
                 )
                 .await;
         }
-        let log_stream =
-            LogStream::new(self.client.clone(), payload.data.terraform_log_url.clone());
+        let log_stream = LogStream::new(
+            self.client.clone(),
+            payload.data.terraform_log_url.clone(),
+            self.config
+                .data_dir
+                .join("log-spool")
+                .join(&payload.data.run_id),
+        );
         let heartbeat = self.start_heartbeat();
-        let execution = self
+        let mut execution = self
             .execute_phase(
                 payload,
                 container,
@@ -269,12 +319,23 @@ impl Runner {
                 &environment,
                 &preparation,
                 log_stream.writer(),
+                deadline,
             )
             .await;
         heartbeat.abort();
         let log_result = log_stream.finish().await;
-        if let Err(error) = log_result {
-            warn!(error = %error, "log uploader stopped with an error");
+        match log_result {
+            Ok(log_result) => {
+                if let Ok(result) = &mut execution {
+                    result.log_incomplete = log_result.incomplete;
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "log uploader stopped with an error");
+                if let Ok(result) = &mut execution {
+                    result.log_incomplete = true;
+                }
+            }
         }
         execution
     }
@@ -343,10 +404,15 @@ impl Runner {
         container: &JobContainer,
         work_dir: &Path,
         exec_dir: &Path,
+        deadline: JobDeadline,
     ) -> Result<String> {
         let archive = self
-            .client
-            .get_artifact(&payload.data.configuration_version_url)
+            .await_deadline(
+                deadline,
+                "download configuration archive",
+                self.client
+                    .get_artifact(&payload.data.configuration_version_url),
+            )
             .await
             .context("download configuration archive")?;
         let config_digest = bytes_digest(&archive);
@@ -367,10 +433,14 @@ impl Runner {
         container: &JobContainer,
         work_dir: &Path,
         exec_dir: &Path,
+        deadline: JobDeadline,
     ) -> Result<(ProvenanceManifest, String)> {
         let snapshot = self
-            .client
-            .get_artifact(&payload.data.filesystem_url)
+            .await_deadline(
+                deadline,
+                "download plan filesystem snapshot",
+                self.client.get_artifact(&payload.data.filesystem_url),
+            )
             .await
             .context("download plan filesystem snapshot")?;
         extract_tar_gz(&snapshot, work_dir).context("extract plan filesystem snapshot")?;
@@ -394,6 +464,7 @@ impl Runner {
         environment: &[(String, String)],
         preparation: &Preparation,
         log_writer: LogWriter,
+        deadline: JobDeadline,
     ) -> Result<RunResult> {
         match &payload.phase {
             Phase::Plan => {
@@ -414,7 +485,7 @@ impl Runner {
                         work_dir,
                         environment,
                         &log_writer,
-                        &payload.data.timeout,
+                        deadline,
                     )
                     .await
                     .context("run terraform init")?;
@@ -471,7 +542,7 @@ impl Runner {
                         work_dir,
                         environment,
                         &log_writer,
-                        &payload.data.timeout,
+                        deadline,
                     )
                     .await
                     .context("run terraform plan")?;
@@ -493,19 +564,22 @@ impl Runner {
                         exec_dir,
                         work_dir,
                         environment,
-                        &payload.data.timeout,
+                        deadline,
                     )
                     .await
                     .context("capture terraform plan JSON")?;
                 let counts = PlanCounts::from_plan(&plan_json);
-                self.client
-                    .put_text(
+                self.await_deadline(
+                    deadline,
+                    "upload plan JSON",
+                    self.client.put_text(
                         &payload.data.json_plan_url,
                         plan_json.to_string(),
                         "application/json",
-                    )
-                    .await
-                    .context("upload plan JSON")?;
+                    ),
+                )
+                .await
+                .context("upload plan JSON")?;
                 self.metrics
                     .stage_event(
                         "plan_json.uploaded",
@@ -521,15 +595,22 @@ impl Runner {
                         exec_dir,
                         work_dir,
                         environment,
-                        &payload.data.timeout,
+                        deadline,
                     )
                     .await
                 {
                     Ok(schemas) => {
                         let path = format!("/api/agent/jobs/{}/provider-schemas", payload.job_id);
                         if let Err(error) = self
-                            .client
-                            .put_text(&path, schemas.to_string(), "application/json")
+                            .await_deadline(
+                                deadline,
+                                "upload provider schemas",
+                                self.client.put_text(
+                                    &path,
+                                    schemas.to_string(),
+                                    "application/json",
+                                ),
+                            )
                             .await
                         {
                             warn!(error = %error, "provider schema upload failed");
@@ -575,10 +656,17 @@ impl Runner {
                 };
                 let provenance_digest = persist(&manifest, work_dir)?;
                 let snapshot = pack_tar_gz(work_dir).context("pack plan filesystem snapshot")?;
-                self.client
-                    .put_artifact(&payload.data.filesystem_url, snapshot, "application/gzip")
-                    .await
-                    .context("upload plan filesystem snapshot")?;
+                self.await_deadline(
+                    deadline,
+                    "upload plan filesystem snapshot",
+                    self.client.put_artifact(
+                        &payload.data.filesystem_url,
+                        snapshot,
+                        "application/gzip",
+                    ),
+                )
+                .await
+                .context("upload plan filesystem snapshot")?;
                 self.metrics
                     .stage_event(
                         "snapshot.uploaded",
@@ -592,6 +680,7 @@ impl Runner {
                     json_state: None,
                     json_state_outputs: None,
                     provenance_digest: Some(provenance_digest),
+                    log_incomplete: false,
                     apply_error: None,
                     state_recovered: false,
                     state_recovery_required: false,
@@ -647,7 +736,7 @@ impl Runner {
                             work_dir,
                             environment,
                             &log_writer,
-                            &payload.data.timeout,
+                            deadline,
                         )
                         .await;
                     let apply_error = match result {
@@ -683,7 +772,7 @@ impl Runner {
                         exec_dir,
                         work_dir,
                         environment,
-                        &payload.data.timeout,
+                        deadline,
                         &state_path,
                     )
                     .await
@@ -727,11 +816,14 @@ impl Runner {
                                 .filter(|url| !url.is_empty());
                             if let Some(url) = state_artifact_url {
                                 match self
-                                    .client
-                                    .put_artifact_file(
-                                        url,
-                                        &work_dir.join(STATE_ARTIFACT_FILE),
-                                        "application/gzip",
+                                    .await_deadline(
+                                        deadline,
+                                        "upload state artifact",
+                                        self.client.put_artifact_file(
+                                            url,
+                                            &work_dir.join(STATE_ARTIFACT_FILE),
+                                            "application/gzip",
+                                        ),
                                     )
                                     .await
                                 {
@@ -810,6 +902,7 @@ impl Runner {
                     json_state,
                     json_state_outputs,
                     provenance_digest: Some(provenance_digest),
+                    log_incomplete: false,
                     state_digest,
                     state_bytes,
                     state_artifact,
@@ -916,6 +1009,7 @@ impl Runner {
         name: &str,
         data: &JobData,
         container: &JobContainer,
+        deadline: JobDeadline,
     ) -> Result<PathBuf> {
         let product = match name {
             "terraform" => Product::Terraform,
@@ -941,16 +1035,19 @@ impl Runner {
         let installed = installed
             .map(|path| validate_secure_executable(&path, "IaC binary", false))
             .transpose()?;
-        self.toolchain
-            .resolve(
+        self.await_deadline(
+            deadline,
+            "resolve IaC toolchain",
+            self.toolchain.resolve(
                 &self.client,
                 product,
                 &container.terraform_version,
                 installed.as_deref(),
                 &data.terraform_url,
                 &data.terraform_checksum,
-            )
-            .await
+            ),
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -962,7 +1059,7 @@ impl Runner {
         work_dir: &Path,
         environment: &[(String, String)],
         logs: &LogWriter,
-        timeout_text: &str,
+        deadline: JobDeadline,
     ) -> Result<bool> {
         let mut command =
             self.sandbox
@@ -972,14 +1069,14 @@ impl Runner {
         let stderr = child.stderr.take().context("capture command stderr")?;
         let stdout_task = tokio::spawn(read_to_log(stdout, logs.clone()));
         let stderr_task = tokio::spawn(read_to_log(stderr, logs.clone()));
-        let timeout = parse_job_timeout(timeout_text);
+        let timeout = deadline.remaining("IaC command")?;
         let status = match time::timeout(timeout, child.wait()).await {
             Ok(status) => status.context("wait for IaC command")?,
             Err(_) => {
                 terminate_child(&mut child).await;
                 stdout_task.abort();
                 stderr_task.abort();
-                bail!("IaC command exceeded {} seconds", timeout.as_secs());
+                bail!("IaC command exceeded the job execution deadline");
             }
         };
         stdout_task.await.context("join stdout reader")??;
@@ -995,7 +1092,7 @@ impl Runner {
         cwd: &Path,
         work_dir: &Path,
         environment: &[(String, String)],
-        timeout_text: &str,
+        deadline: JobDeadline,
         output_path: &Path,
     ) -> Result<StateCapture> {
         let owned_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -1016,7 +1113,7 @@ impl Runner {
             MAX_STATE_BYTES,
         ));
         let stderr_task = tokio::spawn(read_limited_async(stderr, 1 << 20));
-        let timeout = parse_job_timeout(timeout_text);
+        let timeout = deadline.remaining("Terraform state pull")?;
         let mut command_error = None;
         let status = match time::timeout(timeout, child.wait()).await {
             Ok(status) => match status {
@@ -1028,10 +1125,8 @@ impl Runner {
             },
             Err(_) => {
                 terminate_child(&mut child).await;
-                command_error = Some(format!(
-                    "terraform state pull exceeded {} seconds",
-                    timeout.as_secs()
-                ));
+                command_error =
+                    Some("terraform state pull exceeded the job execution deadline".to_owned());
                 None
             }
         };
@@ -1073,7 +1168,7 @@ impl Runner {
         cwd: &Path,
         work_dir: &Path,
         environment: &[(String, String)],
-        timeout_text: &str,
+        deadline: JobDeadline,
     ) -> Result<Value> {
         let owned_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let mut command = self.sandbox.choose_command(
@@ -1089,17 +1184,14 @@ impl Runner {
         let stderr = child.stderr.take().context("capture JSON stderr")?;
         let stdout_task = tokio::spawn(read_limited_async(stdout, MAX_CAPTURE_BYTES));
         let stderr_task = tokio::spawn(read_limited_async(stderr, 1 << 20));
-        let timeout = parse_job_timeout(timeout_text);
+        let timeout = deadline.remaining("JSON capture command")?;
         let status = match time::timeout(timeout, child.wait()).await {
             Ok(status) => status.context("wait for JSON capture command")?,
             Err(_) => {
                 terminate_child(&mut child).await;
                 stdout_task.abort();
                 stderr_task.abort();
-                bail!(
-                    "JSON capture command exceeded {} seconds",
-                    timeout.as_secs()
-                );
+                bail!("JSON capture command exceeded the job execution deadline");
             }
         };
         let stdout = stdout_task.await.context("join JSON stdout reader")??;
@@ -1123,6 +1215,7 @@ struct RunResult {
     json_state: Option<String>,
     json_state_outputs: Option<String>,
     provenance_digest: Option<String>,
+    log_incomplete: bool,
     apply_error: Option<String>,
     state_recovered: bool,
     state_recovery_required: bool,
@@ -1171,6 +1264,7 @@ fn completion_from_result(payload: &AgentJobPayload, result: RunResult) -> Compl
             json_state: result.json_state,
             json_state_outputs: result.json_state_outputs,
             provenance_digest: result.provenance_digest,
+            log_incomplete: result.log_incomplete.then_some(true),
             state_recovered: result.state_recovered,
             state_recovery_required: result.state_recovery_required,
             apply_error: result.apply_error,
@@ -1489,10 +1583,10 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn parse_job_timeout(value: &str) -> Duration {
+fn parse_job_timeout(value: &str) -> Result<Duration> {
     let value = value.trim();
     if value.is_empty() {
-        return DEFAULT_JOB_TIMEOUT;
+        return Ok(DEFAULT_JOB_TIMEOUT);
     }
     let (number, multiplier) = if let Some(value) = value.strip_suffix('h') {
         (value, 3_600)
@@ -1501,14 +1595,14 @@ fn parse_job_timeout(value: &str) -> Duration {
     } else if let Some(value) = value.strip_suffix('s') {
         (value, 1)
     } else {
-        return DEFAULT_JOB_TIMEOUT;
+        bail!("invalid job timeout {value:?}; expected a whole number with s, m, or h suffix");
     };
-    number
-        .parse::<u64>()
-        .ok()
-        .map(|seconds| Duration::from_secs(seconds.saturating_mul(multiplier)))
-        .filter(|duration| !duration.is_zero())
-        .unwrap_or(DEFAULT_JOB_TIMEOUT)
+    let seconds = number.parse::<u64>().with_context(|| {
+        format!("invalid job timeout {value:?}; expected a whole number with s, m, or h suffix")
+    })?;
+    Ok(Duration::from_secs(seconds.saturating_mul(multiplier))
+        .max(MIN_JOB_TIMEOUT)
+        .min(MAX_JOB_TIMEOUT))
 }
 
 struct RunDirectory {
@@ -1637,8 +1731,7 @@ where
         if read == 0 {
             return Ok(());
         }
-        logs.append(String::from_utf8_lossy(&buffer[..read]).into_owned())
-            .await?;
+        logs.append(buffer[..read].to_vec()).await?;
     }
 }
 
@@ -1683,128 +1776,6 @@ where
     }
 }
 
-#[derive(Clone)]
-struct LogWriter {
-    sender: mpsc::Sender<String>,
-}
-
-impl LogWriter {
-    async fn append(&self, text: String) -> Result<()> {
-        self.sender
-            .send(text)
-            .await
-            .map_err(|_| anyhow!("log uploader stopped"))
-    }
-}
-
-struct LogStream {
-    writer: Option<LogWriter>,
-    task: JoinHandle<()>,
-}
-
-impl LogStream {
-    fn new(client: Client, url: String) -> Self {
-        let (sender, receiver) = mpsc::channel(64);
-        let writer = LogWriter { sender };
-        let task = tokio::spawn(upload_logs(client, url, receiver));
-        Self {
-            writer: Some(writer),
-            task,
-        }
-    }
-
-    fn writer(&self) -> LogWriter {
-        self.writer
-            .as_ref()
-            .expect("log stream writer exists")
-            .clone()
-    }
-
-    async fn finish(mut self) -> Result<()> {
-        self.writer.take();
-        self.task.await.context("join log uploader")?;
-        Ok(())
-    }
-}
-
-async fn upload_logs(client: Client, url: String, mut receiver: mpsc::Receiver<String>) {
-    let mut buffer = String::new();
-    let mut last_chunk: Option<String> = None;
-    let mut ticker = time::interval(LOG_FLUSH_INTERVAL);
-    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            chunk = receiver.recv() => match chunk {
-                Some(chunk) => {
-                    buffer.push_str(&chunk);
-                    if buffer.len() >= 64 * 1024 {
-                        flush_log(&client, &url, &mut buffer, &mut last_chunk, false).await;
-                    }
-                }
-                None => {
-                    if buffer.is_empty() {
-                        if let Some(last) = last_chunk.as_deref() {
-                            if let Err(error) = retry_log(|| client.put_log(&url, last)).await {
-                                warn!(error = %error, "final log upload failed");
-                            }
-                        }
-                    } else {
-                        flush_log(&client, &url, &mut buffer, &mut last_chunk, true).await;
-                    }
-                    return;
-                }
-            },
-            _ = ticker.tick() => {
-                if !buffer.is_empty() {
-                    flush_log(&client, &url, &mut buffer, &mut last_chunk, false).await;
-                }
-            }
-        }
-    }
-}
-
-async fn flush_log(
-    client: &Client,
-    url: &str,
-    buffer: &mut String,
-    last_chunk: &mut Option<String>,
-    final_upload: bool,
-) {
-    let chunk = std::mem::take(buffer);
-    *last_chunk = Some(chunk.clone());
-    let result = if final_upload {
-        retry_log(|| client.put_log(url, &chunk)).await
-    } else {
-        retry_log(|| client.patch_log(url, &chunk)).await
-    };
-    if let Err(error) = result {
-        warn!(error = %error, final_upload, "run log upload failed");
-    }
-}
-
-async fn retry_log<F, Fut>(mut request: F) -> Result<()>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), crate::client::ClientError>>,
-{
-    let mut delay = Duration::from_millis(100);
-    let mut last_error = None;
-    for attempt in 0..3 {
-        match request().await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt == 2 {
-                    break;
-                }
-                time::sleep(delay).await;
-                delay = delay.saturating_mul(2);
-            }
-        }
-    }
-    Err(anyhow!("{}", last_error.expect("retry has an error")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1820,9 +1791,18 @@ mod tests {
 
     #[test]
     fn parses_job_timeout() {
-        assert_eq!(parse_job_timeout("1h"), Duration::from_secs(3_600));
-        assert_eq!(parse_job_timeout("30m"), Duration::from_secs(1_800));
-        assert_eq!(parse_job_timeout("bad"), DEFAULT_JOB_TIMEOUT);
+        assert_eq!(parse_job_timeout("1h").unwrap(), Duration::from_secs(3_600));
+        assert_eq!(
+            parse_job_timeout("30m").unwrap(),
+            Duration::from_secs(1_800)
+        );
+        assert_eq!(parse_job_timeout("").unwrap(), DEFAULT_JOB_TIMEOUT);
+        assert!(parse_job_timeout("bad").is_err());
+        assert_eq!(parse_job_timeout("0s").unwrap(), MIN_JOB_TIMEOUT);
+        assert_eq!(
+            parse_job_timeout("9999999999999999999h").unwrap(),
+            MAX_JOB_TIMEOUT
+        );
     }
 
     #[test]
@@ -2044,6 +2024,15 @@ mod tests {
         assert_eq!(counts.changes, 1);
         assert_eq!(counts.destructions, 1);
         assert_eq!(counts.imports, 1);
+    }
+
+    #[test]
+    fn import_only_plan_counts_as_changes() {
+        let counts = PlanCounts {
+            imports: 1,
+            ..PlanCounts::default()
+        };
+        assert!(counts.has_changes());
     }
 
     #[test]

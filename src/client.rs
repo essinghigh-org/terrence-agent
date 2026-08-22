@@ -576,12 +576,23 @@ impl Client {
         self.send_empty(request, &path).await
     }
 
-    pub async fn patch_log(&self, url: &str, text: &str) -> Result<(), ClientError> {
-        self.send_log(url, "PATCH", text, '\u{0002}').await
+    pub async fn patch_log_chunk(
+        &self,
+        url: &str,
+        sequence: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Option<u64>, ClientError> {
+        self.send_log(url, "PATCH", sequence, bytes, '\u{0002}')
+            .await
     }
 
-    pub async fn put_log(&self, url: &str, text: &str) -> Result<(), ClientError> {
-        self.send_log(url, "PUT", text, '\u{0003}').await
+    pub async fn put_log_chunk(
+        &self,
+        url: &str,
+        sequence: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Option<u64>, ClientError> {
+        self.send_log(url, "PUT", sequence, bytes, '\u{0003}').await
     }
 
     fn api_url(&self, path: &str) -> Url {
@@ -980,13 +991,14 @@ impl Client {
         &self,
         url: &str,
         method: &str,
-        text: &str,
+        sequence: u64,
+        bytes: Vec<u8>,
         marker: char,
-    ) -> Result<(), ClientError> {
+    ) -> Result<Option<u64>, ClientError> {
         let artifact = self.resolve_url(url)?;
         let address = self.validate_artifact_url(&artifact).await?;
         let path = url_label_url(artifact.as_url());
-        let mut body = text.as_bytes().to_vec();
+        let mut body = bytes;
         body.push(marker as u8);
         let http = self.artifact_http_for(&artifact, address)?;
         let request = match method {
@@ -995,8 +1007,30 @@ impl Client {
             _ => unreachable!("only PATCH and PUT are valid log methods"),
         }
         .header("content-type", "application/octet-stream")
+        // These headers are ignored by older Terrence servers. Newer servers
+        // can use them to ACK and deduplicate chunks without changing the body
+        // format used by tfc-agent.
+        .header("tfc-agent-log-protocol-version", "1")
+        .header("tfc-agent-log-sequence", sequence.to_string())
         .body(body);
-        self.send_empty(request, &path).await
+        let response = request
+            .send()
+            .await
+            .map_err(|source| ClientError::Network {
+                path: path.clone(),
+                source,
+            })?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(ClientError::Auth(path));
+        }
+        if !response.status().is_success() {
+            return Err(self.http_error(response, &path).await);
+        }
+        Ok(response
+            .headers()
+            .get("tfc-agent-log-ack")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok()))
     }
 
     async fn http_error(&self, response: reqwest::Response, path: &str) -> ClientError {
@@ -1368,11 +1402,11 @@ mod tests {
             .await
             .unwrap();
         client
-            .patch_log(&payload.data.terraform_log_url, "plan output")
+            .patch_log_chunk(&payload.data.terraform_log_url, 1, b"plan output".to_vec())
             .await
             .unwrap();
         client
-            .put_log(&payload.data.terraform_log_url, "plan output")
+            .put_log_chunk(&payload.data.terraform_log_url, 1, b"plan output".to_vec())
             .await
             .unwrap();
         client
@@ -1396,6 +1430,7 @@ mod tests {
                         json_state: None,
                         json_state_outputs: None,
                         provenance_digest: None,
+                        log_incomplete: None,
                         state_recovered: false,
                         state_recovery_required: false,
                         apply_error: None,

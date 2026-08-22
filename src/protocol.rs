@@ -635,6 +635,8 @@ pub struct CompletionData {
     pub json_state_outputs: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_incomplete: Option<bool>,
     #[serde(default)]
     pub state_recovered: bool,
     #[serde(default)]
@@ -688,7 +690,7 @@ pub struct PlanCounts {
 
 impl PlanCounts {
     pub fn has_changes(&self) -> bool {
-        self.additions + self.changes + self.destructions > 0
+        self.additions + self.changes + self.destructions + self.imports > 0
     }
 
     pub fn from_plan(value: &Value) -> Self {

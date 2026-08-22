@@ -317,6 +317,7 @@ mod tests {
                 json_state: Some("{}".to_owned()),
                 json_state_outputs: Some("{}".to_owned()),
                 provenance_digest: None,
+                log_incomplete: None,
                 state_recovered: false,
                 state_recovery_required: false,
                 apply_error: None,
