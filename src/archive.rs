@@ -721,6 +721,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_or_non_gzip_archives() {
+        let destination = tempdir().unwrap();
+        assert!(extract_tar_gz(b"not a gzip archive", destination.path()).is_err());
+
+        let mut bytes = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut bytes, Compression::default());
+            let mut builder = Builder::new(encoder);
+            let mut header = normalized_header(EntryType::Regular, 4, 0o600);
+            builder
+                .append_data(&mut header, "truncated", &b"xxxx"[..])
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        bytes.truncate(bytes.len() / 2);
+        assert!(extract_tar_gz(&bytes, destination.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_archives_with_too_many_entries() {
+        let mut bytes = Vec::new();
+        {
+            let encoder = GzEncoder::new(&mut bytes, Compression::default());
+            let mut builder = Builder::new(encoder);
+            for index in 0..=MAX_ARCHIVE_ENTRIES {
+                let mut header = normalized_header(EntryType::Regular, 0, 0o600);
+                builder
+                    .append_data(&mut header, format!("entry-{index}"), io::empty())
+                    .unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let destination = tempdir().unwrap();
+        assert!(extract_tar_gz(&bytes, destination.path()).is_err());
+    }
+
+    #[test]
     fn file_apis_stream_and_keep_private_modes() {
         let source = tempdir().unwrap();
         fs::write(source.path().join("file"), b"snapshot").unwrap();

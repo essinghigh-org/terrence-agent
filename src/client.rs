@@ -1184,4 +1184,12 @@ mod tests {
         assert_eq!(url_label_url(&url), "/a.bin");
         assert_eq!(url_label("not a URL?secret=1"), "<invalid URL>");
     }
+
+    #[test]
+    fn url_labels_never_include_signed_query_parameters() {
+        assert_eq!(
+            url_label("https://objects.example.test/snapshot.tgz?X-Amz-Signature=secret#fragment"),
+            "/snapshot.tgz"
+        );
+    }
 }

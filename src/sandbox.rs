@@ -243,4 +243,21 @@ mod tests {
         let sandbox = Sandbox::new(&config);
         assert!(!sandbox.enabled());
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_child_stops_the_entire_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & wait")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().unwrap();
+
+        terminate_child(&mut child).await;
+
+        assert!(child.try_wait().unwrap().is_some());
+    }
 }
