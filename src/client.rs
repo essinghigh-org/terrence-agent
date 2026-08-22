@@ -1038,7 +1038,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config(address: String) -> Config {
@@ -1075,6 +1075,22 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/api/agent/register"))
+            .and(header(
+                "tfc-agent-instance-id",
+                "11111111-1111-4111-8111-111111111111",
+            ))
+            .and(header(
+                "tfc-agent-session-id",
+                "22222222-2222-4222-8222-222222222222",
+            ))
+            .and(body_partial_json(json!({
+                "name": "test",
+                "display_name": "test",
+                "hostname": "test-host",
+                "instance_id": "11111111-1111-4111-8111-111111111111",
+                "session_id": "22222222-2222-4222-8222-222222222222",
+                "accept": "plan,apply"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "agent-test",
                 "agent_pool_id": "pool-test"
