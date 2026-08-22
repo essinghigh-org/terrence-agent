@@ -2076,6 +2076,7 @@ mod tests {
         let state_path = temp.path().join(STATE_FILE);
         fs::write(&state_path, b"not-json").unwrap();
         assert!(validate_state_file(&state_path).is_err());
+    }
 
     #[tokio::test]
     async fn reports_unknown_workload_without_running_iac() {
