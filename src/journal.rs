@@ -209,6 +209,13 @@ impl Journal {
     }
 
     fn read(&self, path: &Path) -> Result<JournalEntry> {
+        if fs::symlink_metadata(path)?.file_type().is_symlink() {
+            bail!(
+                "refusing to read symlinked journal record {}",
+                path.display()
+            );
+        }
+        set_private_permissions(path, 0o600)?;
         let file =
             File::open(path).with_context(|| format!("open journal record {}", path.display()))?;
         let raw: JournalFile = serde_json::from_reader(BufReader::new(file))
