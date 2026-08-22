@@ -689,7 +689,7 @@ fn permissions(_mode: u32) -> std::fs::Permissions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, SecretString};
     use std::io::Write;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -798,8 +798,12 @@ mod tests {
             .await;
         let client = Client::new(Config {
             address: server.uri(),
-            token: "test".to_owned(),
-            name: "test".to_owned(),
+            token: SecretString::new("test").unwrap(),
+            token_file: None,
+            display_name: "test".to_owned(),
+            hostname: "test".to_owned(),
+            instance_id: "instance".to_owned(),
+            session_id: "session".to_owned(),
             data_dir: temp.path().join("data"),
             cache_dir: temp.path().join("cache"),
             single: false,
@@ -808,6 +812,7 @@ mod tests {
             log_level: "info".to_owned(),
             log_json: false,
             accept: "plan,apply".to_owned(),
+            max_parallelism: 64,
             terraform_path: None,
             tofu_path: None,
             landlock_runner: None,
