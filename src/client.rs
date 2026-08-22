@@ -9,9 +9,10 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{Context, Result as AnyhowResult, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt;
-use reqwest::{RequestBuilder, StatusCode, header, redirect::Policy};
+use reqwest::{Method, RequestBuilder, StatusCode, header, redirect::Policy};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -19,9 +20,12 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use url::Url;
 
-use crate::config::{Config, SecretString, architecture, operating_system};
+use crate::config::{
+    Config, SecretString, architecture, operating_system, request_forwarding_enabled,
+};
 use crate::protocol::{
-    AgentId, AgentJobPayload, AgentRegistration, CompletionJob, RegisterResponse,
+    AgentId, AgentJobPayload, AgentRegistration, CompletionJob, ForwardedRequest,
+    ForwardedResponse, RegisterResponse,
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 1 << 20;
@@ -35,6 +39,7 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ARTIFACT_ATTEMPTS: usize = 3;
 const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_FORWARD_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -60,6 +65,8 @@ pub enum ClientError {
     },
     #[error("response from {path} exceeded the {limit} byte limit")]
     ResponseTooLarge { path: String, limit: usize },
+    #[error("invalid request forwarding id")]
+    InvalidForwardingId,
     #[error("Terrence asked the agent to retry {path} after {delay:?}")]
     RetryAfter { path: String, delay: Duration },
     #[error("unsafe Terrence URL {value}: {reason}")]
@@ -187,6 +194,7 @@ impl Client {
                 .map(str::to_owned)
                 .collect(),
             accept: self.config.accept.clone(),
+            request_forwarding: request_forwarding_enabled(),
         };
         let request = self
             .control_http
@@ -326,6 +334,168 @@ impl Client {
                 path: "/api/agent/jobs".to_owned(),
                 source,
             })
+    }
+
+    /// Claim and service one existing Terrence request-forwarding item.
+    /// Returns false when the queue is empty; all request/response bytes remain
+    /// bounded by the server's forwarding limits.
+    pub async fn forward_once(&self) -> Result<bool, ClientError> {
+        let Some(request) = self.claim_forwarded_request().await? else {
+            return Ok(false);
+        };
+        let completion = match self.execute_forwarded_request(&request).await {
+            Ok(response) => ForwardedResponse {
+                status: Some(response.status),
+                headers: response.headers,
+                body: Some(BASE64.encode(response.body)),
+                error: None,
+            },
+            Err(error) => ForwardedResponse {
+                status: None,
+                headers: Default::default(),
+                body: None,
+                error: Some(error.to_string().chars().take(2_000).collect()),
+            },
+        };
+        self.complete_forwarded_request(&request.id, &completion)
+            .await?;
+        Ok(true)
+    }
+
+    async fn claim_forwarded_request(&self) -> Result<Option<ForwardedRequest>, ClientError> {
+        let request = self
+            .control_http
+            .get(self.api_url("/api/agent/forwarded-requests"))
+            .headers(self.agent_headers().await?)
+            .timeout(CLAIM_TIMEOUT);
+        let response = request
+            .send()
+            .await
+            .map_err(|source| ClientError::Network {
+                path: "/api/agent/forwarded-requests".to_owned(),
+                source,
+            })?;
+        if response.status() == StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(ClientError::Auth(
+                "/api/agent/forwarded-requests".to_owned(),
+            ));
+        }
+        if !response.status().is_success() {
+            return Err(self
+                .http_error(response, "/api/agent/forwarded-requests")
+                .await);
+        }
+        let bytes = limited_bytes(
+            response,
+            "/api/agent/forwarded-requests",
+            MAX_JOB_PAYLOAD_BYTES,
+        )
+        .await?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| ClientError::Decode {
+                path: "/api/agent/forwarded-requests".to_owned(),
+                source,
+            })
+    }
+
+    async fn complete_forwarded_request(
+        &self,
+        request_id: &str,
+        response: &ForwardedResponse,
+    ) -> Result<(), ClientError> {
+        if !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(ClientError::InvalidForwardingId);
+        }
+        let path = format!("/api/agent/forwarded-requests/{request_id}");
+        let request = self
+            .control_http
+            .put(self.api_url(&path))
+            .headers(self.agent_headers().await?)
+            .header("content-type", "application/json")
+            .timeout(COMPLETION_TIMEOUT)
+            .json(response);
+        let _: Value = self.send_json(request, &path).await?;
+        Ok(())
+    }
+
+    async fn execute_forwarded_request(
+        &self,
+        request: &ForwardedRequest,
+    ) -> AnyhowResult<ForwardedResult> {
+        let url = Url::parse(&request.url).context("parse forwarded request URL")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            bail!("forwarded request URL must be HTTP(S) without credentials");
+        }
+        let method = Method::from_bytes(request.method.as_bytes())
+            .context("parse forwarded request method")?;
+        if method == Method::CONNECT || method == Method::TRACE {
+            bail!("forwarded request method is not supported");
+        }
+        let mut builder = self
+            .control_http
+            .request(method, url)
+            .timeout(Duration::from_secs(120));
+        for (name, values) in &request.headers {
+            if is_hop_by_hop_header(name) {
+                continue;
+            }
+            let header_name = header::HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("invalid forwarded request header name: {name}"))?;
+            for value in values {
+                builder = builder.header(
+                    &header_name,
+                    header::HeaderValue::from_str(value)
+                        .with_context(|| format!("invalid forwarded request header: {name}"))?,
+                );
+            }
+        }
+        if let Some(encoded) = request.body.as_deref() {
+            let body = BASE64
+                .decode(encoded)
+                .context("decode forwarded request body")?;
+            if body.len() > MAX_FORWARD_BODY_BYTES {
+                bail!("forwarded request body exceeds {MAX_FORWARD_BODY_BYTES} bytes");
+            }
+            builder = builder.body(body);
+        }
+        let response = builder.send().await.context("send forwarded request")?;
+        let status = response.status().as_u16();
+        let mut headers = std::collections::HashMap::new();
+        for (name, value) in response.headers() {
+            let name = name.as_str();
+            if is_hop_by_hop_header(name) {
+                continue;
+            }
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            headers
+                .entry(name.to_owned())
+                .or_insert_with(Vec::new)
+                .push(value.to_owned());
+        }
+        let body = limited_bytes(
+            response,
+            "forwarded request response",
+            MAX_FORWARD_BODY_BYTES,
+        )
+        .await
+        .map_err(|error| anyhow!(error))?;
+        Ok(ForwardedResult {
+            status,
+            headers,
+            body,
+        })
     }
 
     pub async fn get_artifact(&self, url: &str) -> Result<Vec<u8>, ClientError> {
@@ -1029,6 +1199,28 @@ fn url_label_url(value: &Url) -> String {
     value.path().to_owned()
 }
 
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+            | "content-length"
+    )
+}
+
+struct ForwardedResult {
+    status: u16,
+    headers: std::collections::HashMap<String, Vec<String>>,
+    body: Vec<u8>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1038,7 +1230,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
-    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::matchers::{body_partial_json, body_string, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config(address: String) -> Config {
@@ -1269,5 +1461,53 @@ mod tests {
             url_label("https://objects.example.test/snapshot.tgz?X-Amz-Signature=secret#fragment"),
             "/snapshot.tgz"
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_existing_server_request_and_reports_bounded_response() {
+        let server = MockServer::start().await;
+        let temp = tempdir().unwrap();
+        let mut test_config = config(server.uri());
+        test_config.data_dir = temp.path().to_path_buf();
+        let client = Client::new(test_config).unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/api/agent/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "agent-forward",
+                "agent_pool_id": "pool-test"
+            })))
+            .mount(&server)
+            .await;
+        client.register().await.unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/private"))
+            .and(body_string("hello"))
+            .respond_with(
+                ResponseTemplate::new(207)
+                    .insert_header("x-forwarded-result", "ok")
+                    .set_body_string("world"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/agent/forwarded-requests"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "afwd-test",
+                "method": "POST",
+                "url": format!("{}/private", server.uri()),
+                "headers": {},
+                "body": BASE64.encode(b"hello")
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/agent/forwarded-requests/afwd-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+
+        assert!(client.forward_once().await.unwrap());
     }
 }

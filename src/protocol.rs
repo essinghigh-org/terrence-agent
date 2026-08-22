@@ -23,6 +23,7 @@ pub struct AgentRegistration {
     pub os: String,
     pub iac_binaries: Vec<String>,
     pub accept: String,
+    pub request_forwarding: bool,
 }
 
 pub const MAX_ID_LENGTH: usize = 200;
@@ -878,7 +879,8 @@ mod tests {
     fn unknown_workload_is_preserved_for_explicit_rejection() {
         let mut value = payload();
         value["type"] = json!("policy");
-        let parsed: AgentJobPayload = serde_json::from_value(value).expect("unknown type remains typed");
+        let parsed: AgentJobPayload =
+            serde_json::from_value(value).expect("unknown type remains typed");
         assert_eq!(parsed.phase.as_str(), "policy");
         assert_eq!(parsed.phase.unsupported(), Some("policy"));
         assert!(parsed.container().is_err());

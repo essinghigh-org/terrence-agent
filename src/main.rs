@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use client::{Client, ClientError};
-use config::Config;
+use config::{Config, request_forwarding_enabled};
 use journal::{Journal, JournalEntry, JournalState};
 use manifest::ExecutionManifest;
 use observability::Metrics;
@@ -90,6 +90,17 @@ async fn main() -> Result<()> {
         "terrence-agent started"
     );
 
+    let forwarding_task = if request_forwarding_enabled() && !config.single {
+        let forwarding_client = client.clone();
+        let forwarding_shutdown = Arc::clone(&shutdown);
+        let forwarding_interval = config.check_interval;
+        Some(tokio::spawn(async move {
+            forwarding_loop(forwarding_client, forwarding_shutdown, forwarding_interval).await;
+        }))
+    } else {
+        None
+    };
+
     let mut idle_round = 0u32;
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -146,12 +157,29 @@ async fn main() -> Result<()> {
         }
     }
 
+    if let Some(task) = forwarding_task {
+        let _ = time::timeout(Duration::from_secs(5), task).await;
+    }
+
     // Graceful shutdown: deregister so the server can reclaim the agent slot.
     if let Err(error) = client.deregister().await {
         warn!(error = %error, "agent deregistration failed during shutdown");
     }
     info!("terrence-agent stopped");
     Ok(())
+}
+
+async fn forwarding_loop(client: Client, shutdown: Arc<AtomicBool>, interval: Duration) {
+    while !shutdown.load(Ordering::SeqCst) {
+        match client.forward_once().await {
+            Ok(true) => continue,
+            Ok(false) => time::sleep(interval).await,
+            Err(error) => {
+                warn!(error = %error, "agent request forwarding failed");
+                time::sleep(interval).await;
+            }
+        }
+    }
 }
 
 /// Wait for a termination signal and request a graceful shutdown.
