@@ -1133,6 +1133,7 @@ mod tests {
                         state: None,
                         json_state: None,
                         json_state_outputs: None,
+                        provenance_digest: None,
                     },
                 }),
             )

@@ -569,6 +569,8 @@ pub struct CompletionData {
     pub json_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub json_state_outputs: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]

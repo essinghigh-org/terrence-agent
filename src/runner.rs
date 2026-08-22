@@ -22,6 +22,11 @@ use crate::protocol::{
     AgentJobPayload, CompletionData, CompletionJob, JobContainer, JobData, Phase, PlanCounts,
     state_outputs,
 };
+use crate::provenance::{
+    AgentMetadata, ExecutionManifest as ProvenanceManifest, SandboxMetadata, ToolMetadata,
+    bytes_digest, file_digest, input_state_digest, lock_file_digest, now_unix_seconds, persist,
+    provider_digests, read, safe_environment, snapshot_digest,
+};
 use crate::provider_cache::ProviderCache;
 use crate::sandbox::{Sandbox, terminate_child};
 use crate::toolchain::{Product, ToolchainResolver};
@@ -42,6 +47,12 @@ pub struct Runner {
 pub struct JobOutcome {
     pub completion: CompletionJob,
     pub work_dir: Option<PathBuf>,
+}
+
+struct Preparation {
+    config_digest: Option<String>,
+    manifest: Option<ProvenanceManifest>,
+    manifest_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -131,6 +142,7 @@ impl Runner {
                             state: None,
                             json_state: None,
                             json_state_outputs: None,
+                            provenance_digest: None,
                         },
                     },
                     work_dir,
@@ -169,16 +181,26 @@ impl Runner {
                 payload.phase.as_str(),
             )
             .await;
-        match payload.phase {
-            Phase::Plan => {
-                self.prepare_plan(payload, container, work_dir, &exec_dir)
-                    .await?
-            }
+        let preparation = match payload.phase {
+            Phase::Plan => Preparation {
+                config_digest: Some(
+                    self.prepare_plan(payload, container, work_dir, &exec_dir)
+                        .await?,
+                ),
+                manifest: None,
+                manifest_digest: None,
+            },
             Phase::Apply => {
-                self.prepare_apply(payload, container, work_dir, &exec_dir)
-                    .await?
+                let (manifest, manifest_digest) = self
+                    .prepare_apply(payload, container, work_dir, &exec_dir)
+                    .await?;
+                Preparation {
+                    config_digest: None,
+                    manifest: Some(manifest),
+                    manifest_digest: Some(manifest_digest),
+                }
             }
-        }
+        };
         self.metrics
             .stage_event(
                 "configuration.download.finished",
@@ -220,6 +242,7 @@ impl Runner {
                 &exec_dir,
                 &binary,
                 &environment,
+                &preparation,
                 log_stream.writer(),
             )
             .await;
@@ -250,18 +273,58 @@ impl Runner {
         })
     }
 
+    fn agent_metadata(&self) -> AgentMetadata {
+        AgentMetadata {
+            name: self.config.display_name.clone(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            os: crate::config::operating_system().to_owned(),
+            arch: crate::config::architecture().to_owned(),
+            process_id: std::process::id(),
+        }
+    }
+
+    fn sandbox_metadata(&self) -> SandboxMetadata {
+        SandboxMetadata {
+            enabled: self.config.sandbox,
+            mode: if self.config.sandbox {
+                "landlock".to_owned()
+            } else {
+                "none".to_owned()
+            },
+            abi: if self.config.sandbox {
+                self.sandbox.probe().ok().flatten()
+            } else {
+                None
+            },
+        }
+    }
+
+    fn tool_metadata(&self, name: &str, version: &str, binary: &Path) -> Result<ToolMetadata> {
+        Ok(ToolMetadata {
+            name: name.to_owned(),
+            version: if version.is_empty() {
+                "unknown".to_owned()
+            } else {
+                version.to_owned()
+            },
+            path: binary.display().to_string(),
+            digest: file_digest(binary)?,
+        })
+    }
+
     async fn prepare_plan(
         &self,
         payload: &AgentJobPayload,
         container: &JobContainer,
         work_dir: &Path,
         exec_dir: &Path,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let archive = self
             .client
             .get_artifact(&payload.data.configuration_version_url)
             .await
             .context("download configuration archive")?;
+        let config_digest = bytes_digest(&archive);
         extract_tar_gz(&archive, work_dir).context("extract configuration archive")?;
         flatten_single_directory(work_dir).context("flatten configuration archive")?;
         fs::create_dir_all(exec_dir)?;
@@ -270,7 +333,7 @@ impl Runner {
             registry_hostname(payload, container),
             run_token(payload, container),
         )?;
-        Ok(())
+        Ok(config_digest)
     }
 
     async fn prepare_apply(
@@ -279,7 +342,7 @@ impl Runner {
         container: &JobContainer,
         work_dir: &Path,
         exec_dir: &Path,
-    ) -> Result<()> {
+    ) -> Result<(ProvenanceManifest, String)> {
         let snapshot = self
             .client
             .get_artifact(&payload.data.filesystem_url)
@@ -292,7 +355,7 @@ impl Runner {
             registry_hostname(payload, container),
             run_token(payload, container),
         )?;
-        Ok(())
+        read(work_dir).context("read execution manifest from plan snapshot")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -304,6 +367,7 @@ impl Runner {
         exec_dir: &Path,
         binary: &Path,
         environment: &[(String, String)],
+        preparation: &Preparation,
         log_writer: LogWriter,
     ) -> Result<RunResult> {
         match payload.phase {
@@ -453,6 +517,38 @@ impl Runner {
                     work_dir.join(".terrence-agent-plan-metadata.json"),
                     serde_json::to_vec(&PlanMetadata::from(&counts))?,
                 )?;
+                let plan_digest = file_digest(&exec_dir.join("tfplan"))?;
+                let manifest = ProvenanceManifest {
+                    schema_version: 1,
+                    run_id: payload.data.run_id.clone(),
+                    job_id: payload.job_id.clone(),
+                    phase: "plan".to_owned(),
+                    status: "finished".to_owned(),
+                    agent: self.agent_metadata(),
+                    tool: self.tool_metadata(
+                        payload.data.iac_binary.as_deref().unwrap_or("terraform"),
+                        &container.terraform_version,
+                        binary,
+                    )?,
+                    config_digest: preparation
+                        .config_digest
+                        .clone()
+                        .context("plan preparation did not record configuration digest")?,
+                    lock_file_digest: lock_file_digest(exec_dir)?,
+                    plan_digest: Some(plan_digest),
+                    snapshot_digest: Some(snapshot_digest(work_dir)?),
+                    provider_digests: provider_digests(exec_dir)?,
+                    working_directory: payload.data.working_directory.clone(),
+                    cli_args: plan_args,
+                    environment: safe_environment(environment),
+                    sandbox: self.sandbox_metadata(),
+                    input_state_digest: input_state_digest(exec_dir)?,
+                    output_state_digest: None,
+                    source_manifest_digest: None,
+                    started_at: now_unix_seconds(),
+                    completed_at: now_unix_seconds(),
+                };
+                let provenance_digest = persist(&manifest, work_dir)?;
                 let snapshot = pack_tar_gz(work_dir).context("pack plan filesystem snapshot")?;
                 self.client
                     .put_artifact(&payload.data.filesystem_url, snapshot, "application/gzip")
@@ -470,6 +566,7 @@ impl Runner {
                     state: None,
                     json_state: None,
                     json_state_outputs: None,
+                    provenance_digest: Some(provenance_digest),
                 })
             }
             Phase::Apply => {
@@ -493,6 +590,19 @@ impl Runner {
                         payload.phase.as_str(),
                     )
                     .await;
+                let plan_manifest = preparation
+                    .manifest
+                    .as_ref()
+                    .context("plan filesystem snapshot is missing its execution manifest")?;
+                self.verify_plan_manifest(
+                    payload,
+                    container,
+                    work_dir,
+                    exec_dir,
+                    binary,
+                    environment,
+                    plan_manifest,
+                )?;
                 let apply_status = self
                     .run_streamed(
                         binary,
@@ -552,14 +662,124 @@ impl Runner {
                     }
                     None => (None, None, None),
                 };
+                let mut manifest = plan_manifest.clone();
+                manifest.phase = "apply".to_owned();
+                manifest.status = "finished".to_owned();
+                manifest.agent = self.agent_metadata();
+                manifest.tool = self.tool_metadata(
+                    payload.data.iac_binary.as_deref().unwrap_or("terraform"),
+                    &container.terraform_version,
+                    binary,
+                )?;
+                manifest.cli_args = apply_args;
+                manifest.sandbox = self.sandbox_metadata();
+                manifest.output_state_digest =
+                    state_text.as_deref().map(str::as_bytes).map(bytes_digest);
+                manifest.source_manifest_digest = preparation.manifest_digest.clone();
+                manifest.started_at = now_unix_seconds();
+                manifest.completed_at = now_unix_seconds();
+                let provenance_digest = persist(&manifest, work_dir)?;
                 Ok(RunResult {
                     counts,
                     state: state_text,
                     json_state,
                     json_state_outputs,
+                    provenance_digest: Some(provenance_digest),
                 })
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_plan_manifest(
+        &self,
+        payload: &AgentJobPayload,
+        container: &JobContainer,
+        work_dir: &Path,
+        exec_dir: &Path,
+        binary: &Path,
+        environment: &[(String, String)],
+        manifest: &ProvenanceManifest,
+    ) -> Result<()> {
+        if manifest.schema_version != 1 {
+            bail!(
+                "unsupported execution manifest schema {}",
+                manifest.schema_version
+            );
+        }
+        if manifest.phase != "plan" {
+            bail!("execution manifest phase is not plan");
+        }
+        if manifest.run_id != payload.data.run_id || manifest.job_id != payload.job_id {
+            bail!("execution manifest run identity does not match apply job");
+        }
+        let os = crate::config::operating_system();
+        if manifest.agent.os != os {
+            bail!(
+                "execution fingerprint mismatch: OS planned on {}, apply agent is {}",
+                manifest.agent.os,
+                os
+            );
+        }
+        let arch = crate::config::architecture();
+        if manifest.agent.arch != arch {
+            bail!(
+                "execution fingerprint mismatch: architecture planned on {}, apply agent is {}",
+                manifest.agent.arch,
+                arch
+            );
+        }
+        let sandbox = self.sandbox_metadata();
+        if manifest.sandbox.enabled != sandbox.enabled
+            || manifest.sandbox.mode != sandbox.mode
+            || manifest.sandbox.abi != sandbox.abi
+        {
+            bail!("execution fingerprint mismatch: sandbox mode or ABI changed");
+        }
+        let requested_tool = payload.data.iac_binary.as_deref().unwrap_or("terraform");
+        if manifest.tool.name != requested_tool {
+            bail!("execution fingerprint mismatch: IaC tool changed");
+        }
+        let binary_digest = file_digest(binary)?;
+        if manifest.tool.digest != binary_digest {
+            bail!("execution fingerprint mismatch: IaC executable digest changed");
+        }
+        if !container.terraform_version.is_empty()
+            && manifest.tool.version != container.terraform_version
+        {
+            bail!("execution fingerprint mismatch: IaC version changed");
+        }
+        let plan_path = exec_dir.join("tfplan");
+        let expected_plan = manifest
+            .plan_digest
+            .as_deref()
+            .context("execution manifest is missing its saved-plan digest")?;
+        if expected_plan != file_digest(&plan_path)? {
+            bail!("execution fingerprint mismatch: saved plan changed");
+        }
+        let expected_snapshot = manifest
+            .snapshot_digest
+            .as_deref()
+            .context("execution manifest is missing its snapshot digest")?;
+        if expected_snapshot != snapshot_digest(work_dir)? {
+            bail!("execution fingerprint mismatch: filesystem snapshot changed");
+        }
+        if manifest.lock_file_digest != lock_file_digest(exec_dir)? {
+            bail!("execution fingerprint mismatch: provider lock file changed");
+        }
+        if manifest.input_state_digest != input_state_digest(exec_dir)? {
+            bail!("execution fingerprint mismatch: input state changed");
+        }
+        if manifest.provider_digests != provider_digests(exec_dir)? {
+            bail!("execution fingerprint mismatch: provider package changed");
+        }
+        if manifest.working_directory != payload.data.working_directory {
+            bail!("execution fingerprint mismatch: working directory changed");
+        }
+        if manifest.environment != safe_environment(environment) {
+            bail!("execution fingerprint mismatch: execution environment changed");
+        }
+        Ok(())
     }
 
     async fn resolve_binary(
@@ -691,6 +911,7 @@ struct RunResult {
     state: Option<String>,
     json_state: Option<String>,
     json_state_outputs: Option<String>,
+    provenance_digest: Option<String>,
 }
 
 fn completion_from_result(payload: &AgentJobPayload, result: RunResult) -> CompletionJob {
@@ -711,6 +932,7 @@ fn completion_from_result(payload: &AgentJobPayload, result: RunResult) -> Compl
             state: result.state,
             json_state: result.json_state,
             json_state_outputs: result.json_state_outputs,
+            provenance_digest: result.provenance_digest,
         },
     }
 }

@@ -301,6 +301,7 @@ mod tests {
                 state: Some("{}".to_owned()),
                 json_state: Some("{}".to_owned()),
                 json_state_outputs: Some("{}".to_owned()),
+                provenance_digest: None,
             },
         }
     }

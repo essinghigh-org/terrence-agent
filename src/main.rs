@@ -6,6 +6,7 @@ mod journal;
 mod manifest;
 mod observability;
 mod protocol;
+mod provenance;
 mod provider_cache;
 mod runner;
 mod sandbox;
