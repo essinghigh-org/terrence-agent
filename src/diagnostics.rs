@@ -173,9 +173,14 @@ async fn connectivity_test() -> Result<()> {
         response.status(),
         started.elapsed().as_millis()
     );
-    if parsed.scheme() == "http" {
-        println!("warning: control-plane URL is not using TLS");
-    }
+    println!(
+        "TLS: {}",
+        if parsed.scheme() == "https" {
+            "HTTPS certificate validated"
+        } else {
+            "not configured (HTTP)"
+        }
+    );
     Ok(())
 }
 
@@ -192,9 +197,11 @@ async fn doctor(args: &[String]) -> Result<()> {
     checks.push(sandbox_check(&config));
     checks.push(cgroup_check());
     checks.push(disk_check(&config.data_dir));
+    checks.push(ownership_mode_check(&config));
     checks.push(binary_check("terraform", config.terraform_path.as_deref()));
     checks.push(binary_check("tofu", config.tofu_path.as_deref()));
     if !offline {
+        checks.push(tls_check(&config.address));
         checks.push(dns_check(&config.address));
         checks.push(control_plane_check(&config.address).await);
     } else {
@@ -350,6 +357,50 @@ fn cgroup_check() -> Check {
     }
 }
 
+fn ownership_mode_check(config: &Config) -> Check {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut details = Vec::new();
+        let mut ok = true;
+        for path in [&config.data_dir, &config.cache_dir] {
+            match fs::metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {
+                    let mode = metadata.permissions().mode() & 0o7777;
+                    if mode & 0o002 != 0 {
+                        ok = false;
+                    }
+                    details.push(format!(
+                        "{} uid={} gid={} mode={mode:04o}",
+                        path.display(),
+                        metadata.uid(),
+                        metadata.gid()
+                    ));
+                }
+                Ok(_) => {
+                    ok = false;
+                    details.push(format!("{} is not a directory", path.display()));
+                }
+                Err(_) => details.push(format!("{} not created yet", path.display())),
+            }
+        }
+        Check {
+            name: "ownership/mode".to_owned(),
+            ok,
+            detail: details.join("; "),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = config;
+        Check {
+            name: "ownership/mode".to_owned(),
+            ok: true,
+            detail: "not supported on this platform".to_owned(),
+        }
+    }
+}
+
 fn disk_check(path: &Path) -> Check {
     let existing = nearest_existing(path).unwrap_or_else(|| PathBuf::from("/"));
     #[cfg(unix)]
@@ -450,6 +501,26 @@ fn dns_check(address: &str) -> Check {
         },
         Err(error) => Check {
             name: "DNS".to_owned(),
+            ok: false,
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn tls_check(address: &str) -> Check {
+    match Url::parse(address) {
+        Ok(parsed) if parsed.scheme() == "https" => Check {
+            name: "TLS".to_owned(),
+            ok: true,
+            detail: "HTTPS configured; reqwest validates the peer certificate".to_owned(),
+        },
+        Ok(parsed) => Check {
+            name: "TLS".to_owned(),
+            ok: false,
+            detail: format!("insecure {} URL", parsed.scheme()),
+        },
+        Err(error) => Check {
+            name: "TLS".to_owned(),
             ok: false,
             detail: error.to_string(),
         },
