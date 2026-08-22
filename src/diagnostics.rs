@@ -590,7 +590,7 @@ fn write_support_bundle(path: &Path, config: &Config, checks: &[Check]) -> Resul
         "agent_version": env!("CARGO_PKG_VERSION"),
         "config": {
             "address": safe_address(&config.address)?,
-            "name": config.name,
+            "name": config.display_name,
             "data_dir": config.data_dir,
             "cache_dir": config.cache_dir,
             "single": config.single,
