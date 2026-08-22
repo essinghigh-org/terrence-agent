@@ -86,6 +86,14 @@ fn extract_tar_gz_reader<R: Read>(reader: R, destination: &Path) -> Result<()> {
 
         let entry_type = entry.header().entry_type();
         let relative = validate_entry_path(&entry.path().context("read tar entry path")?)?;
+        let entry_size = entry.header().size().context("read tar entry size")?;
+        if entry_size > MAX_ARCHIVE_FILE_BYTES {
+            bail!(
+                "archive entry {} exceeds the {} byte file limit",
+                relative.display(),
+                MAX_ARCHIVE_FILE_BYTES
+            );
+        }
         if matches!(
             entry_type,
             EntryType::XHeader
@@ -114,14 +122,7 @@ fn extract_tar_gz_reader<R: Read>(reader: R, destination: &Path) -> Result<()> {
             );
         }
 
-        let size = entry.header().size().context("read tar entry size")?;
-        if size > MAX_ARCHIVE_FILE_BYTES {
-            bail!(
-                "archive entry {} exceeds the {} byte file limit",
-                relative.display(),
-                MAX_ARCHIVE_FILE_BYTES
-            );
-        }
+        let size = entry_size;
         if state.extracted_bytes.saturating_add(size) > MAX_EXTRACTED_BYTES {
             bail!("archive expands beyond the extraction limit");
         }
