@@ -21,6 +21,7 @@ use crate::protocol::{
     AgentJobPayload, CompletionData, CompletionJob, JobContainer, JobData, Phase, PlanCounts,
     state_outputs,
 };
+use crate::provider_cache::ProviderCache;
 use crate::sandbox::{Sandbox, terminate_child};
 use crate::toolchain::{Product, ToolchainResolver};
 
@@ -165,7 +166,7 @@ impl Runner {
         let binary = self
             .resolve_binary(binary_name, &payload.data, container)
             .await?;
-        let environment = execution_environment(payload, container, work_dir);
+        let environment = execution_environment(payload, container, work_dir)?;
         let log_stream =
             LogStream::new(self.client.clone(), payload.data.terraform_log_url.clone());
         let heartbeat = self.start_heartbeat();
@@ -614,7 +615,7 @@ fn execution_environment(
     payload: &AgentJobPayload,
     container: &JobContainer,
     work_dir: &Path,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>> {
     let mut env = payload
         .data
         .environment
@@ -632,9 +633,14 @@ fn execution_environment(
         env.entry("TERRENCE_ADDRESS".to_owned())
             .or_insert_with(|| api_address.clone());
     }
+    if let Some(cache) = ProviderCache::from_env()? {
+        cache.apply_to_environment(&mut env);
+    } else {
+        ProviderCache::remove_from_environment(&mut env);
+    }
     let mut values = env.into_iter().collect::<Vec<_>>();
     values.sort_by(|left, right| left.0.cmp(&right.0));
-    values
+    Ok(values)
 }
 
 fn registry_hostname(payload: &AgentJobPayload, container: &JobContainer) -> String {

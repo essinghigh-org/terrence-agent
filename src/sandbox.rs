@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use tokio::process::{Child, Command};
 
 use crate::config::Config;
+use crate::provider_cache::ProviderCache;
 
 pub struct Sandbox {
     runner: Option<PathBuf>,
@@ -63,6 +64,9 @@ impl Sandbox {
         command.arg("--ro=/etc").arg("--rw-files=/dev");
         if let Some(path) = resolver_dir {
             command.arg(format!("--ro={}", path.display()));
+        }
+        if let Some(cache) = ProviderCache::from_env()? {
+            command.arg(cache.landlock_read_argument());
         }
         command
             .arg(format!("--cwd={}", cwd.display()))
