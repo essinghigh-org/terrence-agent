@@ -64,7 +64,14 @@ fn write_canonical(value: &Value, output: &mut Vec<u8>) -> std::io::Result<()> {
             output.write_all(b"]")
         }
         Value::Object(values) => {
-            let mut keys = values.keys().collect::<Vec<_>>();
+            // Missing and explicit `null` are equivalent for the optional
+            // wire fields this client accepts; ignoring nulls keeps a payload
+            // fingerprint stable when the server adds an optional field.
+            let mut keys = values
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>();
             keys.sort_unstable();
             output.write_all(b"{")?;
             for (index, key) in keys.iter().enumerate() {
@@ -133,6 +140,15 @@ mod tests {
                 .unwrap(),
             payload_fingerprint(&changed).unwrap()
         );
+    }
+
+    #[test]
+    fn canonical_fingerprint_ignores_optional_nulls() {
+        let mut with_null = Vec::new();
+        let mut without_null = Vec::new();
+        write_canonical(&serde_json::json!({"a": null}), &mut with_null).unwrap();
+        write_canonical(&serde_json::json!({}), &mut without_null).unwrap();
+        assert_eq!(with_null, without_null);
     }
 
     #[test]
