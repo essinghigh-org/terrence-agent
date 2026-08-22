@@ -166,7 +166,7 @@ impl Runner {
         let binary = self
             .resolve_binary(binary_name, &payload.data, container)
             .await?;
-        let environment = execution_environment(payload, container, work_dir)?;
+        let environment = execution_environment(payload, container, work_dir, self.config.sandbox)?;
         let log_stream =
             LogStream::new(self.client.clone(), payload.data.terraform_log_url.clone());
         let heartbeat = self.start_heartbeat();
@@ -615,6 +615,7 @@ fn execution_environment(
     payload: &AgentJobPayload,
     container: &JobContainer,
     work_dir: &Path,
+    sandbox_enabled: bool,
 ) -> Result<Vec<(String, String)>> {
     let mut env = payload
         .data
@@ -634,6 +635,9 @@ fn execution_environment(
             .or_insert_with(|| api_address.clone());
     }
     if let Some(cache) = ProviderCache::from_env()? {
+        if !sandbox_enabled {
+            bail!("Terraform provider cache requires the Landlock sandbox");
+        }
         cache.apply_to_environment(&mut env);
     } else {
         ProviderCache::remove_from_environment(&mut env);
