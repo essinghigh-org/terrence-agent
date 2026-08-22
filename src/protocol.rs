@@ -420,19 +420,50 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Phase {
     Plan,
     Apply,
+    Unsupported(String),
 }
 
 impl Phase {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Plan => "plan",
             Self::Apply => "apply",
+            Self::Unsupported(value) => value,
         }
+    }
+
+    pub fn unsupported(&self) -> Option<&str> {
+        match self {
+            Self::Unsupported(value) => Some(value),
+            Self::Plan | Self::Apply => None,
+        }
+    }
+}
+
+impl Serialize for Phase {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Phase {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            "plan" => Self::Plan,
+            "apply" => Self::Apply,
+            _ => Self::Unsupported(value),
+        })
     }
 }
 
@@ -451,7 +482,7 @@ pub struct AgentJobPayload {
 
 impl AgentJobPayload {
     pub fn container(&self) -> anyhow::Result<&JobContainer> {
-        match self.phase {
+        match &self.phase {
             Phase::Plan => self
                 .plan
                 .as_ref()
@@ -460,6 +491,7 @@ impl AgentJobPayload {
                 .apply
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("job payload is missing its apply container")),
+            Phase::Unsupported(value) => Err(anyhow::anyhow!("unsupported_workload: {value}")),
         }
     }
 }
@@ -625,6 +657,24 @@ pub struct StateArtifact {
     pub reference: String,
     pub digest: String,
     pub bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ForwardedRequest {
+    pub id: String,
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: HashMap<String, Vec<String>>,
+    pub body: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ForwardedResponse {
+    pub status: Option<u16>,
+    pub headers: HashMap<String, Vec<String>>,
+    pub body: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -822,5 +872,15 @@ mod tests {
             assert!(result.is_ok(), "decoder panicked for {sample}");
         }
         assert!(serde_json::from_value::<AgentJobPayload>(payload()).is_ok());
+    }
+
+    #[test]
+    fn unknown_workload_is_preserved_for_explicit_rejection() {
+        let mut value = payload();
+        value["type"] = json!("policy");
+        let parsed: AgentJobPayload = serde_json::from_value(value).expect("unknown type remains typed");
+        assert_eq!(parsed.phase.as_str(), "policy");
+        assert_eq!(parsed.phase.unsupported(), Some("policy"));
+        assert!(parsed.container().is_err());
     }
 }

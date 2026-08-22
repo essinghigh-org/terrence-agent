@@ -119,7 +119,9 @@ impl Runner {
     }
 
     pub async fn run(&self, payload: &AgentJobPayload) -> JobOutcome {
-        let (result, work_dir) = if let Err(error) = validate_payload_identifiers(payload) {
+        let (result, work_dir) = if let Some(workload) = payload.phase.unsupported() {
+            (Err(anyhow!("unsupported_workload: {workload}")), None)
+        } else if let Err(error) = validate_payload_identifiers(payload) {
             (Err(error), None)
         } else {
             match RunDirectory::create(&self.config.data_dir) {
@@ -203,7 +205,7 @@ impl Runner {
                 payload.phase.as_str(),
             )
             .await;
-        let preparation = match payload.phase {
+        let preparation = match &payload.phase {
             Phase::Plan => Preparation {
                 config_digest: Some(
                     self.prepare_plan(payload, container, work_dir, &exec_dir)
@@ -222,6 +224,7 @@ impl Runner {
                     manifest_digest: Some(manifest_digest),
                 }
             }
+            Phase::Unsupported(workload) => bail!("unsupported_workload: {workload}"),
         };
         self.metrics
             .stage_event(
@@ -392,7 +395,7 @@ impl Runner {
         preparation: &Preparation,
         log_writer: LogWriter,
     ) -> Result<RunResult> {
-        match payload.phase {
+        match &payload.phase {
             Phase::Plan => {
                 let init_args = vec![
                     "init".to_owned(),
@@ -812,6 +815,7 @@ impl Runner {
                     state_artifact,
                 })
             }
+            Phase::Unsupported(workload) => bail!("unsupported_workload: {workload}"),
         }
     }
 
@@ -2072,5 +2076,21 @@ mod tests {
         let state_path = temp.path().join(STATE_FILE);
         fs::write(&state_path, b"not-json").unwrap();
         assert!(validate_state_file(&state_path).is_err());
+
+    #[tokio::test]
+    async fn reports_unknown_workload_without_running_iac() {
+        let temp = tempdir().unwrap();
+        let runner = test_runner(temp.path().join("data"));
+        let mut payload = test_payload("job-1", "run-1");
+        payload.phase = Phase::Unsupported("policy".to_owned());
+
+        let outcome = runner.run(&payload).await;
+        assert_eq!(outcome.completion.status, "errored");
+        assert_eq!(
+            outcome.completion.error.as_deref(),
+            Some("unsupported_workload: policy")
+        );
+        assert_eq!(outcome.completion.data.operation, "policy");
+        assert!(!temp.path().join("runs/run-1").exists());
     }
 }
