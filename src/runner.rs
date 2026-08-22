@@ -16,6 +16,7 @@ use tracing::warn;
 use crate::archive::{extract_tar_gz, flatten_single_directory, pack_tar_gz};
 use crate::client::Client;
 use crate::config::Config;
+use crate::manifest::ExecutionManifest;
 use crate::protocol::{
     AgentJobPayload, CompletionData, CompletionJob, JobContainer, JobData, Phase, PlanCounts,
     state_outputs,
@@ -37,6 +38,7 @@ pub struct Runner {
 
 pub struct JobOutcome {
     pub completion: CompletionJob,
+    pub work_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -83,27 +85,21 @@ impl Runner {
     }
 
     pub async fn run(&self, payload: &AgentJobPayload) -> JobOutcome {
-        let result = if let Err(error) = validate_payload_identifiers(payload) {
-            Err(error)
+        let (result, work_dir) = if let Err(error) = validate_payload_identifiers(payload) {
+            (Err(error), None)
         } else {
             match RunDirectory::create(&self.config.data_dir) {
                 Ok(run_directory) => {
-                    let result = self.run_inner(payload, run_directory.path()).await;
-                    if let Err(error) = run_directory.cleanup().await {
-                        warn!(
-                            path = %run_directory.path().display(),
-                            error = %error,
-                            "failed to remove run directory"
-                        );
-                    }
-                    result
+                    let work_dir = run_directory.path().to_owned();
+                    (self.run_inner(payload, &work_dir).await, Some(work_dir))
                 }
-                Err(error) => Err(error),
+                Err(error) => (Err(error), None),
             }
         };
         match result {
             Ok(result) => JobOutcome {
                 completion: completion_from_result(payload, result),
+                work_dir,
             },
             Err(error) => {
                 let message = format_error(&error);
@@ -128,9 +124,17 @@ impl Runner {
                             json_state_outputs: None,
                         },
                     },
+                    work_dir,
                 }
             }
         }
+    }
+
+    pub async fn cleanup_manifest(&self, manifest: &ExecutionManifest) -> Result<()> {
+        let Some(path) = manifest.work_dir.as_deref() else {
+            return Ok(());
+        };
+        RunDirectory::cleanup_path(&self.config.data_dir, path).await
     }
 
     async fn run_inner(&self, payload: &AgentJobPayload, work_dir: &Path) -> Result<RunResult> {
@@ -817,6 +821,17 @@ impl RunDirectory {
             );
         }
         remove_dir(&self.path).await
+    }
+
+    async fn cleanup_path(data_dir: &Path, path: &Path) -> Result<()> {
+        let runs = data_dir.join("runs");
+        let root = fs::canonicalize(&runs)
+            .with_context(|| format!("resolve run directory {}", runs.display()))?;
+        let run_directory = Self {
+            root,
+            path: path.to_path_buf(),
+        };
+        run_directory.cleanup().await
     }
 }
 

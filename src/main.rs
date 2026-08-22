@@ -2,6 +2,8 @@ mod archive;
 mod client;
 mod config;
 mod diagnostics;
+mod journal;
+mod manifest;
 mod protocol;
 mod runner;
 mod sandbox;
@@ -13,10 +15,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use client::{Client, ClientError};
 use config::Config;
-use protocol::{AgentJobPayload, CompletionJob};
+use journal::{Journal, JournalEntry, JournalState};
+use manifest::ExecutionManifest;
+use protocol::CompletionJob;
 use runner::Runner;
 use tokio::sync::Notify;
 use tokio::time;
@@ -33,6 +37,7 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&config.data_dir)
         .await
         .with_context(|| format!("create data directory {}", config.data_dir.display()))?;
+    let journal = Journal::open(&config.data_dir)?;
 
     let client = Client::new(config.clone())?;
     let runner = Runner::new(client.clone());
@@ -76,24 +81,32 @@ async fn main() -> Result<()> {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
-        let poll_result =
-            match poll_once(&client, &runner, &config, &shutdown, &shutdown_notify).await {
-                Ok(poll_result) => poll_result,
-                Err(error) => {
-                    if matches!(
-                        error.downcast_ref::<ClientError>(),
-                        Some(ClientError::Auth(_))
-                    ) {
-                        warn!(error = %error, "agent authentication failed; re-registering");
-                        if !register_with_retry(&client, &shutdown, &shutdown_notify).await? {
-                            break;
-                        }
-                    } else {
-                        warn!(error = %error, "agent check-in failed");
+        let poll_result = match poll_once(
+            &client,
+            &runner,
+            &journal,
+            &config,
+            &shutdown,
+            &shutdown_notify,
+        )
+        .await
+        {
+            Ok(poll_result) => poll_result,
+            Err(error) => {
+                if matches!(
+                    error.downcast_ref::<ClientError>(),
+                    Some(ClientError::Auth(_))
+                ) {
+                    warn!(error = %error, "agent authentication failed; re-registering");
+                    if !register_with_retry(&client, &shutdown, &shutdown_notify).await? {
+                        break;
                     }
-                    PollResult::Idle
+                } else {
+                    warn!(error = %error, "agent check-in failed");
                 }
-            };
+                PollResult::Idle
+            }
+        };
         let delay = match poll_result {
             PollResult::Shutdown => break,
             PollResult::Job { single } => {
@@ -209,12 +222,17 @@ enum PollResult {
 async fn poll_once(
     client: &Client,
     runner: &Runner,
+    journal: &Journal,
     config: &Config,
     shutdown: &Arc<AtomicBool>,
     notify: &Arc<Notify>,
 ) -> Result<PollResult> {
     if shutdown.load(Ordering::SeqCst) {
         return Ok(PollResult::Shutdown);
+    }
+    if let Some(entry) = journal.unfinished()?.into_iter().next() {
+        finish_journal_entry(client, runner, journal, entry).await?;
+        return Ok(PollResult::Idle);
     }
     let claim = tokio::select! {
         result = client.claim() => result,
@@ -234,11 +252,20 @@ async fn poll_once(
         binary = payload.data.iac_binary.as_deref().unwrap_or("terraform"),
         "claimed agent job"
     );
+    let manifest = ExecutionManifest::from_payload(&payload)?;
+    let journal_entry = journal.start(manifest)?;
+    if journal_entry.state != JournalState::Claimed {
+        finish_journal_entry(client, runner, journal, journal_entry).await?;
+        return Ok(PollResult::Idle);
+    }
+    let journal_entry = journal.mark_executing(&journal_entry)?;
     if let Err(error) = client.put_status("busy", None).await {
         warn!(error = %error, "failed to report busy status");
     }
     let outcome = runner.run(&payload).await;
-    report_completion(client, &payload, outcome.completion).await?;
+    let journal_entry =
+        journal.record_completion(&journal_entry, &outcome.completion, outcome.work_dir)?;
+    finish_journal_entry(client, runner, journal, journal_entry).await?;
     if config.single {
         info!("single-job mode complete");
         return Ok(PollResult::Job { single: true });
@@ -246,21 +273,62 @@ async fn poll_once(
     Ok(PollResult::Job { single: false })
 }
 
-async fn report_completion(
+async fn report_completion_details(
     client: &Client,
-    payload: &AgentJobPayload,
+    phase: &str,
+    run_id: &str,
     completion: CompletionJob,
 ) -> Result<()> {
     match client.put_status("idle", Some(&completion)).await {
         Ok(()) => {
-            info!(phase = payload.phase.as_str(), run_id = %payload.data.run_id, status = completion.status, "reported job completion");
+            info!(
+                phase,
+                run_id,
+                status = completion.status,
+                "reported job completion"
+            );
             Ok(())
         }
         Err(error) => {
-            error!(phase = payload.phase.as_str(), run_id = %payload.data.run_id, error = %error, "failed to report job completion");
+            error!(phase, run_id, error = %error, "failed to report job completion");
             Err(error.into())
         }
     }
+}
+
+async fn finish_journal_entry(
+    client: &Client,
+    runner: &Runner,
+    journal: &Journal,
+    entry: JournalEntry,
+) -> Result<()> {
+    let entry = match entry.state {
+        JournalState::CompletionPending => {
+            let completion = entry
+                .completion()
+                .cloned()
+                .context("completion-pending journal entry has no completion")?;
+            report_completion_details(
+                client,
+                &entry.manifest.phase,
+                &entry.manifest.run_id,
+                completion,
+            )
+            .await?;
+            journal.mark_completion_acked(&entry)?
+        }
+        JournalState::CompletionAcked => entry,
+        JournalState::CleanupDone => return Ok(()),
+        JournalState::Claimed | JournalState::Executing => {
+            bail!(
+                "execution for job {} is already claimed without a durable completion; refusing to rerun",
+                entry.manifest.job_id
+            )
+        }
+    };
+    runner.cleanup_manifest(&entry.manifest).await?;
+    journal.mark_cleanup_done(&entry)?;
+    Ok(())
 }
 
 fn idle_backoff(base: Duration, idle_round: u32) -> Duration {

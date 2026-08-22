@@ -405,7 +405,7 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
     Plan,
@@ -421,7 +421,7 @@ impl Phase {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AgentJobPayload {
     #[serde(rename = "type")]
     pub phase: Phase,
@@ -449,7 +449,7 @@ impl AgentJobPayload {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct JobData {
     #[allow(dead_code)]
     #[serde(deserialize_with = "deserialize_name")]
@@ -494,7 +494,7 @@ pub struct JobData {
     pub environment: HashMap<String, String>,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct JobContainer {
     #[serde(default)]
     #[allow(dead_code)]
@@ -551,7 +551,7 @@ pub struct CompletionJob {
     pub data: CompletionData,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CompletionData {
     pub run_id: String,
     pub operation: String,
