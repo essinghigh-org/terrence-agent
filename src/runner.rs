@@ -809,7 +809,7 @@ impl Runner {
                     output_state_digest: None,
                     source_manifest_digest: None,
                     started_at: phase_started_at,
-                    completed_at: now_unix_seconds(),
+                    completed_at: now_unix_seconds().max(phase_started_at.saturating_add(1)),
                 };
                 let provenance_digest = persist(&manifest, work_dir)?;
                 let snapshot_path = work_dir.join("tmp/plan-snapshot.tar.gz");
@@ -1035,7 +1035,6 @@ impl Runner {
                 let mut state_bytes = None;
                 let mut state_artifact = None;
                 let mut state_text = None;
-                let json_state = state_text.clone();
                 let mut json_state_outputs = None;
                 let mut state_commit_error = None;
 
@@ -1095,6 +1094,7 @@ impl Runner {
                     }
                 }
 
+                let json_state = state_text.clone();
                 let state_recovery_required = !state_recovered
                     || state_recovery_error.is_some()
                     || state_commit_error.is_some();
@@ -1126,7 +1126,7 @@ impl Runner {
                 manifest.output_state_digest = state_digest.clone();
                 manifest.source_manifest_digest = preparation.manifest_digest.clone();
                 manifest.started_at = phase_started_at;
-                manifest.completed_at = now_unix_seconds();
+                manifest.completed_at = now_unix_seconds().max(phase_started_at.saturating_add(1));
                 let provenance_digest = persist(&manifest, work_dir)?;
                 Ok(RunResult {
                     counts,

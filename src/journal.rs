@@ -15,6 +15,7 @@ use crate::protocol::{CompletionData, CompletionJob};
 
 const JOURNAL_DIR: &str = "journal";
 const JOURNAL_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_JOURNAL_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Durable local execution states.  A record with a completion is safe to
 /// resend; no state below `completion_pending` may execute the job again.
@@ -233,6 +234,13 @@ impl Journal {
         }
         let file =
             File::open(path).with_context(|| format!("open journal record {}", path.display()))?;
+        if file.metadata()?.len() > MAX_JOURNAL_RECORD_BYTES {
+            bail!(
+                "journal record {} exceeds the {} byte limit",
+                path.display(),
+                MAX_JOURNAL_RECORD_BYTES
+            );
+        }
         let raw: JournalFile = serde_json::from_reader(BufReader::new(file))
             .with_context(|| format!("decode journal record {}", path.display()))?;
         self.to_entry(raw)
