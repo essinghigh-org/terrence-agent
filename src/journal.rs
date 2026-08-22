@@ -138,11 +138,9 @@ impl Journal {
     }
 
     pub fn mark_completion_acked(&self, entry: &JournalEntry) -> Result<JournalEntry> {
-        let completion = entry
-            .completion
-            .as_ref()
-            .map(StoredCompletion::from_completion);
-        self.update(entry, JournalState::CompletionAcked, completion)
+        // Once the server has acknowledged the completion, no retry payload
+        // is needed; keep only the manifest until the run directory is gone.
+        self.update(entry, JournalState::CompletionAcked, None)
     }
 
     pub fn mark_cleanup_done(&self, entry: &JournalEntry) -> Result<JournalEntry> {
@@ -353,6 +351,7 @@ mod tests {
             .unwrap();
         let acked = journal.mark_completion_acked(&pending).unwrap();
         assert_eq!(acked.state, JournalState::CompletionAcked);
+        assert!(acked.completion().is_none());
         let done = journal.mark_cleanup_done(&acked).unwrap();
         assert_eq!(done.state, JournalState::CleanupDone);
         assert!(done.completion().is_none());
