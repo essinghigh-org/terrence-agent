@@ -291,8 +291,13 @@ async fn poll_once(
     }
     let outcome = runner.run(&payload).await;
     let completion_status = outcome.completion.status;
-    let journal_entry =
-        journal.record_completion(&journal_entry, &outcome.completion, outcome.work_dir)?;
+    let retain_work_dir = outcome.completion.data.state_recovery_required;
+    let journal_entry = journal.record_completion(
+        &journal_entry,
+        &outcome.completion,
+        outcome.work_dir,
+        retain_work_dir,
+    )?;
     metrics.timeline(
         "completion.sent",
         Some(&payload.data.run_id),
@@ -368,6 +373,14 @@ async fn finish_journal_entry(
             )
         }
     };
+    if entry.retain_work_dir {
+        warn!(
+            job_id = %entry.manifest.job_id,
+            run_id = %entry.manifest.run_id,
+            "retaining run directory for state recovery"
+        );
+        return Ok(());
+    }
     runner.cleanup_manifest(&entry.manifest).await?;
     journal.mark_cleanup_done(&entry)?;
     Ok(())

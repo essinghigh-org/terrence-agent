@@ -62,6 +62,10 @@ impl StoredCompletion {
 struct JournalFile {
     manifest: ExecutionManifest,
     state: JournalState,
+    /// Keep the opaque run directory after the completion ACK for an
+    /// operator/state-recovery workflow. Older records default to cleanup.
+    #[serde(default)]
+    retain_work_dir: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     completion: Option<StoredCompletion>,
 }
@@ -71,6 +75,7 @@ struct JournalFile {
 pub struct JournalEntry {
     pub manifest: ExecutionManifest,
     pub state: JournalState,
+    pub retain_work_dir: bool,
     completion: Option<CompletionJob>,
 }
 
@@ -108,6 +113,7 @@ impl Journal {
         let file = JournalFile {
             manifest,
             state: JournalState::Claimed,
+            retain_work_dir: false,
             completion: None,
         };
         self.write(&path, &file)?;
@@ -123,11 +129,13 @@ impl Journal {
         entry: &JournalEntry,
         completion: &CompletionJob,
         work_dir: Option<PathBuf>,
+        retain_work_dir: bool,
     ) -> Result<JournalEntry> {
         let manifest = entry.manifest.clone().with_work_dir(work_dir);
         let entry = JournalEntry {
             manifest,
             state: entry.state,
+            retain_work_dir,
             completion: entry.completion.clone(),
         };
         self.update(
@@ -168,10 +176,15 @@ impl Journal {
         Ok(entries
             .into_iter()
             .filter(|entry| {
-                !matches!(
+                if matches!(
                     entry.state,
                     JournalState::Claimed | JournalState::CleanupDone
-                )
+                ) {
+                    return false;
+                }
+                // A completion ACK with retained artifacts is intentionally
+                // terminal until an operator performs state recovery.
+                !(entry.state == JournalState::CompletionAcked && entry.retain_work_dir)
             })
             .collect())
     }
@@ -185,6 +198,7 @@ impl Journal {
         let file = JournalFile {
             manifest: entry.manifest.clone(),
             state,
+            retain_work_dir: entry.retain_work_dir,
             completion,
         };
         let path = self.path_for_job(&file.manifest.job_id);
@@ -196,6 +210,7 @@ impl Journal {
         Ok(JournalEntry {
             manifest: file.manifest,
             state: file.state,
+            retain_work_dir: file.retain_work_dir,
             completion: file
                 .completion
                 .map(StoredCompletion::into_completion)
@@ -327,6 +342,7 @@ mod tests {
                 &executing,
                 &completion(),
                 executing.manifest.work_dir.clone(),
+                false,
             )
             .unwrap();
         assert_eq!(pending.state, JournalState::CompletionPending);
@@ -348,7 +364,12 @@ mod tests {
         let journal = Journal::open(directory.path()).unwrap();
         let entry = journal.start(manifest(directory.path())).unwrap();
         let pending = journal
-            .record_completion(&entry, &completion(), entry.manifest.work_dir.clone())
+            .record_completion(
+                &entry,
+                &completion(),
+                entry.manifest.work_dir.clone(),
+                false,
+            )
             .unwrap();
         let acked = journal.mark_completion_acked(&pending).unwrap();
         assert_eq!(acked.state, JournalState::CompletionAcked);
@@ -357,5 +378,23 @@ mod tests {
         assert_eq!(done.state, JournalState::CleanupDone);
         assert!(done.completion().is_none());
         assert!(journal.unfinished().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_completion_ack_does_not_cleanup_or_requeue() {
+        let directory = tempdir().unwrap();
+        let journal = Journal::open(directory.path()).unwrap();
+        let entry = journal.start(manifest(directory.path())).unwrap();
+        let pending = journal
+            .record_completion(&entry, &completion(), entry.manifest.work_dir.clone(), true)
+            .unwrap();
+        assert!(pending.retain_work_dir);
+        let acked = journal.mark_completion_acked(&pending).unwrap();
+        assert!(acked.retain_work_dir);
+        assert!(journal.unfinished().unwrap().is_empty());
+        let reopened = Journal::open(directory.path()).unwrap();
+        let loaded = reopened.start(acked.manifest.clone()).unwrap();
+        assert_eq!(loaded.state, JournalState::CompletionAcked);
+        assert!(loaded.retain_work_dir);
     }
 }
