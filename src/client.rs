@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::config::{Config, SecretString, architecture, operating_system};
-use crate::protocol::{AgentJobPayload, AgentRegistration, CompletionJob};
+use crate::protocol::{AgentId, AgentJobPayload, AgentRegistration, CompletionJob, RegisterResponse};
 
 const MAX_ERROR_BODY_BYTES: usize = 1 << 20;
 const MAX_JOB_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -47,20 +47,10 @@ pub enum ClientError {
 pub struct Client {
     http: reqwest::Client,
     config: Arc<Config>,
-    agent_id: Arc<Mutex<Option<String>>>,
+    agent_id: Arc<Mutex<Option<AgentId>>>,
     session_token: Arc<Mutex<Option<SecretString>>>,
     message_index: Arc<AtomicU64>,
 }
-
-#[derive(serde::Deserialize)]
-struct RegisterResponse {
-    id: String,
-    #[allow(dead_code)]
-    agent_pool_id: String,
-    #[serde(default)]
-    session_token: Option<String>,
-}
-
 impl Client {
     pub fn new(config: Config) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -102,7 +92,8 @@ impl Client {
             .header("tfc-agent-session-id", self.config.session_id.clone())
             .json(&body);
         let result: RegisterResponse = self.send_json(request, "/api/agent/register").await?;
-        *self.agent_id.lock().await = Some(result.id.clone());
+        let agent_id = result.id.clone();
+        *self.agent_id.lock().await = Some(agent_id.clone());
         let session_token = match result.session_token {
             Some(value) => Some(SecretString::new(value).map_err(|_| {
                 ClientError::Auth("Terrence returned an invalid session token".to_owned())
@@ -110,7 +101,7 @@ impl Client {
             None => None,
         };
         *self.session_token.lock().await = session_token;
-        Ok(result.id)
+        Ok(agent_id.to_string())
     }
 
     pub async fn put_status(
@@ -284,18 +275,19 @@ impl Client {
         };
         headers.insert(
             "tfc-agent-id",
-            header::HeaderValue::from_str(&agent_id)
-                .expect("agent id must be a valid HTTP header value"),
+            header::HeaderValue::from_str(agent_id.as_str()).map_err(|_| {
+                ClientError::Auth("registered agent id is not a valid HTTP header value".to_owned())
+            })?,
         );
         headers.insert(
             "tfc-agent-instance-id",
             header::HeaderValue::from_str(&self.config.instance_id)
-                .expect("agent instance id must be a valid HTTP header value"),
+                .map_err(|_| ClientError::Auth("agent instance id is not a valid HTTP header value".to_owned()))?,
         );
         headers.insert(
             "tfc-agent-session-id",
             header::HeaderValue::from_str(&self.config.session_id)
-                .expect("agent session id must be a valid HTTP header value"),
+                .map_err(|_| ClientError::Auth("agent session id is not a valid HTTP header value".to_owned()))?,
         );
         Ok(headers)
     }
