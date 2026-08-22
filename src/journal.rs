@@ -146,11 +146,9 @@ impl Journal {
     }
 
     pub fn mark_cleanup_done(&self, entry: &JournalEntry) -> Result<JournalEntry> {
-        let completion = entry
-            .completion
-            .as_ref()
-            .map(StoredCompletion::from_completion);
-        self.update(entry, JournalState::CleanupDone, completion)
+        // The control-plane ACK makes the completion payload disposable. Keep
+        // only the manifest/fingerprint so a duplicate claim cannot execute.
+        self.update(entry, JournalState::CleanupDone, None)
     }
 
     pub fn for_job(&self, job_id: &str) -> Result<Option<JournalEntry>> {
@@ -343,6 +341,7 @@ mod tests {
         assert_eq!(acked.state, JournalState::CompletionAcked);
         let done = journal.mark_cleanup_done(&acked).unwrap();
         assert_eq!(done.state, JournalState::CleanupDone);
+        assert!(done.completion().is_none());
         assert!(journal.unfinished().unwrap().is_empty());
     }
 }
