@@ -32,10 +32,12 @@
 #include <fcntl.h>
 #include <linux/landlock.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -50,7 +52,7 @@
 #endif
 
 /* Version reported by --version. Bump on user-visible runner changes. */
-#define LANDLOCK_RUNNER_VERSION "1.2.0"
+#define LANDLOCK_RUNNER_VERSION "1.3.0"
 
 #ifndef LANDLOCK_CREATE_RULESET_VERSION
 #define LANDLOCK_CREATE_RULESET_VERSION (1U << 0)
@@ -80,9 +82,23 @@
 
 #define LL_READ (LL_READ_FILE | LL_READ_DIR)
 #define LL_RW   (LL_READ | LL_WRITE_FILE | LL_REMOVE_DIR | LL_REMOVE_FILE | \
-                 LL_MAKE_CHAR | LL_MAKE_DIR | LL_MAKE_REG | LL_MAKE_SOCK | \
-                 LL_MAKE_FIFO | LL_MAKE_BLOCK | LL_MAKE_SYM | LL_RESOLVE_UNIX)
+                 LL_MAKE_DIR | LL_MAKE_REG | LL_MAKE_SOCK | LL_MAKE_FIFO | \
+                 LL_MAKE_SYM | LL_RESOLVE_UNIX)
 #define LL_EXEC  (LL_EXECUTE | LL_READ)
+
+#ifndef LANDLOCK_RULE_NET_PORT
+#define LANDLOCK_RULE_NET_PORT 2
+#endif
+#ifndef LANDLOCK_ACCESS_NET_BIND_TCP
+#define LANDLOCK_ACCESS_NET_BIND_TCP (1ULL << 0)
+#define LANDLOCK_ACCESS_NET_CONNECT_TCP (1ULL << 1)
+#define LANDLOCK_ACCESS_NET_BIND_UDP (1ULL << 2)
+#define LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP (1ULL << 3)
+struct landlock_net_port_attr {
+    uint64_t allowed_access;
+    uint64_t port;
+};
+#endif
 
 /* Keep building against older libc kernel headers while using newer Landlock
  * fields when the running kernel supports them. */
@@ -114,6 +130,25 @@ static uint64_t abi_mask(uint64_t access, long abi) {
     return access;
 }
 
+static uint64_t net_abi_mask(uint64_t access, long abi) {
+    if (abi < 4) access &= ~(LANDLOCK_ACCESS_NET_BIND_TCP |
+                              LANDLOCK_ACCESS_NET_CONNECT_TCP);
+    if (abi < 10) access &= ~(LANDLOCK_ACCESS_NET_BIND_UDP |
+                               LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP);
+    return access;
+}
+
+static int parse_port(const char *text, uint64_t *port) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value > 65535UL) {
+        return -1;
+    }
+    *port = (uint64_t)value;
+    return 0;
+}
+
 static long landlock_abi(void) {
     return syscall(__NR_landlock_create_ruleset, NULL, 0,
                    LANDLOCK_CREATE_RULESET_VERSION);
@@ -125,6 +160,20 @@ static int add_path_rule(int ruleset_fd, uint64_t access, const char *path) {
         fprintf(stderr, "landlock-runner: cannot open '%s': %s\n",
                 path, strerror(errno));
         return -1;
+    }
+
+    struct stat metadata = {0};
+    if (fstat(dir_fd, &metadata) != 0) {
+        fprintf(stderr, "landlock-runner: cannot stat '%s': %s\n",
+                path, strerror(errno));
+        close(dir_fd);
+        return -1;
+    }
+    if (!S_ISDIR(metadata.st_mode)) {
+        /* Directory-only rights make the kernel reject file/device rules. */
+        access &= ~(LL_READ_DIR | LL_REMOVE_DIR | LL_MAKE_CHAR | LL_MAKE_DIR |
+                    LL_MAKE_REG | LL_MAKE_SOCK | LL_MAKE_FIFO | LL_MAKE_BLOCK |
+                    LL_MAKE_SYM);
     }
 
     struct landlock_path_beneath_attr rule = {0};
@@ -143,6 +192,20 @@ static int add_path_rule(int ruleset_fd, uint64_t access, const char *path) {
     return 0;
 }
 
+static int add_net_rule(int ruleset_fd, uint64_t access, uint64_t port) {
+    struct landlock_net_port_attr rule = {0};
+    rule.allowed_access = access;
+    rule.port = port;
+    long ret = syscall(__NR_landlock_add_rule, ruleset_fd,
+                       LANDLOCK_RULE_NET_PORT, &rule, 0);
+    if (ret != 0) {
+        fprintf(stderr, "landlock-runner: add network rule for port %llu: %s\n",
+                (unsigned long long)port, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 static int probe(void) {
     long abi = landlock_abi();
     if (abi < 1) {
@@ -156,7 +219,8 @@ static int probe(void) {
 static void usage(void) {
     fprintf(stderr,
         "usage: landlock-runner --probe\n"
-        "   or: landlock-runner (--rwx=PATH | --rw=PATH | --rw-files=PATH | --rx=PATH | --ro=PATH)* [--cwd=DIR] -- ABSOLUTE_CMD [ARGS...]\n");
+        "   or: landlock-runner [--min-abi=N] [--tcp-connect=PORT | --tcp-bind=PORT | --udp-connect=PORT | --udp-bind=PORT]*\n"
+        "       (--rwx=PATH | --rw=PATH | --rw-files=PATH | --rx=PATH | --ro=PATH)* [--cwd=DIR] -- ABSOLUTE_CMD [ARGS...]\n");
 }
 
 int main(int argc, char **argv) {
@@ -175,10 +239,13 @@ int main(int argc, char **argv) {
     }
 
     const char *cwd = NULL;
+    unsigned long minimum_abi = 1;
 
     /* First pass: collect rules (no restrictions applied yet). */
     struct { const char *path; uint64_t access; } rules[64];
     int n_rules = 0;
+    struct { uint64_t port; uint64_t access; } net_rules[64];
+    int n_net_rules = 0;
 
     int i = 1;
     int saw_dashdash = 0;
@@ -193,6 +260,42 @@ int main(int argc, char **argv) {
         }
         if (strncmp(arg, "--cwd=", 6) == 0) {
             cwd = arg + 6;
+            continue;
+        }
+        if (strncmp(arg, "--min-abi=", 10) == 0) {
+            char *end = NULL;
+            errno = 0;
+            minimum_abi = strtoul(arg + 10, &end, 10);
+            if (errno != 0 || end == arg + 10 || *end != '\0' || minimum_abi < 1) {
+                fprintf(stderr, "landlock-runner: invalid minimum ABI: %s\n", arg + 10);
+                return 1;
+            }
+            continue;
+        }
+        uint64_t net_access = 0;
+        const char *port_text = NULL;
+        if (strncmp(arg, "--tcp-connect=", 14) == 0) {
+            net_access = LANDLOCK_ACCESS_NET_CONNECT_TCP;
+            port_text = arg + 14;
+        } else if (strncmp(arg, "--tcp-bind=", 11) == 0) {
+            net_access = LANDLOCK_ACCESS_NET_BIND_TCP;
+            port_text = arg + 11;
+        } else if (strncmp(arg, "--udp-connect=", 14) == 0) {
+            net_access = LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP;
+            port_text = arg + 14;
+        } else if (strncmp(arg, "--udp-bind=", 11) == 0) {
+            net_access = LANDLOCK_ACCESS_NET_BIND_UDP;
+            port_text = arg + 11;
+        }
+        if (net_access != 0) {
+            uint64_t port = 0;
+            if (n_net_rules >= 64 || parse_port(port_text, &port) != 0) {
+                fprintf(stderr, "landlock-runner: invalid network port: %s\n", port_text);
+                return 1;
+            }
+            net_rules[n_net_rules].port = port;
+            net_rules[n_net_rules].access = net_access;
+            n_net_rules++;
             continue;
         }
         const char *path = NULL;
@@ -223,9 +326,21 @@ int main(int argc, char **argv) {
 
     /* Query ABI; refuse to run without Landlock support. */
     long abi = landlock_abi();
-    if (abi < 1) {
+    if (abi < 1 || (unsigned long)abi < minimum_abi) {
         fprintf(stderr, "landlock-runner: Landlock not supported (ABI %ld)\n", abi);
         return 2;
+    }
+
+    for (int n = 0; n < n_net_rules; n++) {
+        if ((abi < 4 && (net_rules[n].access &
+                         (LANDLOCK_ACCESS_NET_BIND_TCP |
+                          LANDLOCK_ACCESS_NET_CONNECT_TCP))) ||
+            (abi < 10 && (net_rules[n].access &
+                          (LANDLOCK_ACCESS_NET_BIND_UDP |
+                           LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP)))) {
+            fprintf(stderr, "landlock-runner: requested network rules require a newer Landlock ABI\n");
+            return 2;
+        }
     }
 
     /* prctl(PR_SET_NO_NEW_PRIVS) is required before restrict_self. */
@@ -237,10 +352,17 @@ int main(int argc, char **argv) {
 
     struct ll_ruleset_attr rs_attr = {0};
     rs_attr.handled_access_fs = handled_access(abi);
+    if (n_net_rules > 0) {
+        for (int n = 0; n < n_net_rules; n++) {
+            rs_attr.handled_access_net |= net_abi_mask(net_rules[n].access, abi);
+        }
+    }
     if (abi >= 6) {
         rs_attr.scoped = LL_SCOPE_ABSTRACT_UNIX_SOCKET | LL_SCOPE_SIGNAL;
     }
-    size_t rs_attr_size = abi >= 6 ? sizeof(rs_attr) : sizeof(rs_attr.handled_access_fs);
+    size_t rs_attr_size = sizeof(rs_attr.handled_access_fs);
+    if (abi >= 4) rs_attr_size = offsetof(struct ll_ruleset_attr, scoped);
+    if (abi >= 6) rs_attr_size = sizeof(rs_attr);
     int ruleset_fd = (int) syscall(__NR_landlock_create_ruleset, &rs_attr,
                                    rs_attr_size, 0);
     if (ruleset_fd < 0) {
@@ -251,6 +373,14 @@ int main(int argc, char **argv) {
 
     for (int r = 0; r < n_rules; r++) {
         if (add_path_rule(ruleset_fd, abi_mask(rules[r].access, abi), rules[r].path) != 0) {
+            close(ruleset_fd);
+            return 2;
+        }
+    }
+
+    for (int n = 0; n < n_net_rules; n++) {
+        if (add_net_rule(ruleset_fd, net_abi_mask(net_rules[n].access, abi),
+                         net_rules[n].port) != 0) {
             close(ruleset_fd);
             return 2;
         }
