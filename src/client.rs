@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::config::{Config, architecture, operating_system};
-use crate::protocol::{AgentJobPayload, CompletionJob};
+use crate::config::{Config, SecretString, architecture, operating_system};
+use crate::protocol::{AgentJobPayload, AgentRegistration, CompletionJob};
 
 const MAX_ERROR_BODY_BYTES: usize = 1 << 20;
 const MAX_JOB_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -48,14 +48,17 @@ pub struct Client {
     http: reqwest::Client,
     config: Arc<Config>,
     agent_id: Arc<Mutex<Option<String>>>,
+    session_token: Arc<Mutex<Option<SecretString>>>,
     message_index: Arc<AtomicU64>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 struct RegisterResponse {
     id: String,
     #[allow(dead_code)]
     agent_pool_id: String,
+    #[serde(default)]
+    session_token: Option<String>,
 }
 
 impl Client {
@@ -69,6 +72,7 @@ impl Client {
             http,
             config: Arc::new(config),
             agent_id: Arc::new(Mutex::new(None)),
+            session_token: Arc::new(Mutex::new(None)),
             message_index: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -78,21 +82,34 @@ impl Client {
     }
 
     pub async fn register(&self) -> Result<String, ClientError> {
-        let body = json!({
-            "name": self.config.name,
-            "arch": architecture(),
-            "os": operating_system(),
-            "iac_binaries": ["terraform", "tofu"],
-        });
+        let body = AgentRegistration {
+            name: self.config.display_name.clone(),
+            display_name: self.config.display_name.clone(),
+            hostname: self.config.hostname.clone(),
+            instance_id: self.config.instance_id.clone(),
+            session_id: self.config.session_id.clone(),
+            arch: architecture().to_owned(),
+            os: operating_system().to_owned(),
+            iac_binaries: vec!["terraform".to_owned(), "tofu".to_owned()],
+        };
         let request = self
             .http
             .post(self.api_url("/api/agent/register"))
             .headers(self.auth_headers()?)
             .header("content-type", "application/json")
             .header("tfc-agent-version", env!("CARGO_PKG_VERSION"))
+            .header("tfc-agent-instance-id", self.config.instance_id.clone())
+            .header("tfc-agent-session-id", self.config.session_id.clone())
             .json(&body);
         let result: RegisterResponse = self.send_json(request, "/api/agent/register").await?;
         *self.agent_id.lock().await = Some(result.id.clone());
+        let session_token = match result.session_token {
+            Some(value) => Some(SecretString::new(value).map_err(|_| {
+                ClientError::Auth("Terrence returned an invalid session token".to_owned())
+            })?),
+            None => None,
+        };
+        *self.session_token.lock().await = session_token;
         Ok(result.id)
     }
 
@@ -235,11 +252,22 @@ impl Client {
     }
 
     fn auth_headers(&self) -> Result<reqwest::header::HeaderMap, ClientError> {
+        let token = self
+            .config
+            .current_token()
+            .map_err(|error| ClientError::Auth(format!("unable to load agent token: {error:#}")))?;
+        self.token_headers(&token)
+    }
+
+    fn token_headers(
+        &self,
+        token: &SecretString,
+    ) -> Result<reqwest::header::HeaderMap, ClientError> {
         let mut headers = reqwest::header::HeaderMap::new();
-        let authorization = header::HeaderValue::from_str(&format!("Bearer {}", self.config.token))
-            .map_err(|_| {
-                ClientError::Auth("agent token is not a valid HTTP header value".to_owned())
-            })?;
+        let authorization =
+            header::HeaderValue::from_str(&format!("Bearer {}", token.expose_secret())).map_err(
+                |_| ClientError::Auth("agent token is not a valid HTTP header value".to_owned()),
+            )?;
         headers.insert(header::AUTHORIZATION, authorization);
         Ok(headers)
     }
@@ -249,11 +277,25 @@ impl Client {
         let Some(agent_id) = agent_id else {
             return Err(ClientError::Auth("agent is not registered".to_owned()));
         };
-        let mut headers = self.auth_headers()?;
+        let session_token = self.session_token.lock().await.clone();
+        let mut headers = match session_token {
+            Some(token) => self.token_headers(&token)?,
+            None => self.auth_headers()?,
+        };
         headers.insert(
             "tfc-agent-id",
             header::HeaderValue::from_str(&agent_id)
                 .expect("agent id must be a valid HTTP header value"),
+        );
+        headers.insert(
+            "tfc-agent-instance-id",
+            header::HeaderValue::from_str(&self.config.instance_id)
+                .expect("agent instance id must be a valid HTTP header value"),
+        );
+        headers.insert(
+            "tfc-agent-session-id",
+            header::HeaderValue::from_str(&self.config.session_id)
+                .expect("agent session id must be a valid HTTP header value"),
         );
         Ok(headers)
     }
@@ -375,20 +417,24 @@ fn url_label(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, SecretString};
     use crate::protocol::{CompletionData, CompletionJob};
     use serde_json::json;
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn config(address: String) -> Config {
         Config {
             address,
-            token: "agent-test".to_owned(),
-            name: "test".to_owned(),
+            token: SecretString::new("agent-test").unwrap(),
+            token_file: None,
+            display_name: "test".to_owned(),
+            hostname: "test-host".to_owned(),
+            instance_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            session_id: "22222222-2222-4222-8222-222222222222".to_owned(),
             data_dir: PathBuf::from("/tmp/terrence-agent-test"),
             cache_dir: PathBuf::from("/tmp/terrence-agent-test/cache"),
             single: false,
@@ -413,6 +459,21 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/api/agent/register"))
+            .and(body_partial_json(json!({
+                "name": "test",
+                "display_name": "test",
+                "hostname": "test-host",
+                "instance_id": "11111111-1111-4111-8111-111111111111",
+                "session_id": "22222222-2222-4222-8222-222222222222"
+            })))
+            .and(header(
+                "tfc-agent-instance-id",
+                "11111111-1111-4111-8111-111111111111",
+            ))
+            .and(header(
+                "tfc-agent-session-id",
+                "22222222-2222-4222-8222-222222222222",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "agent-test",
                 "agent_pool_id": "pool-test"

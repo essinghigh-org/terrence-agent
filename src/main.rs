@@ -44,7 +44,14 @@ async fn main() -> Result<()> {
     }
 
     register_with_retry(&client).await?;
-    info!(name = %config.name, address = %config.address, "terrence-agent started");
+    info!(
+        display_name = %config.display_name,
+        hostname = %config.hostname,
+        instance_id = %config.instance_id,
+        session_id = %config.session_id,
+        address = %config.address,
+        "terrence-agent started"
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let force_exit = Arc::new(AtomicBool::new(false));
@@ -95,7 +102,7 @@ async fn main() -> Result<()> {
 /// shutdown deadline.
 #[cfg(unix)]
 async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, _force_exit: Arc<AtomicBool>) {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut sigquit = signal(SignalKind::quit()).expect("install SIGQUIT handler");
@@ -199,7 +206,9 @@ fn rand_jitter(max: u64) -> u64 {
 fn init_logging(level: &str, json: bool) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(false);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false);
     if json {
         builder.json().init();
     } else {

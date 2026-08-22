@@ -3,6 +3,24 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Registration data sent by the agent.
+///
+/// `name` remains the wire-compatible field consumed by existing Terrence
+/// servers.  The identity fields are additive so a server that understands
+/// process/session fencing can distinguish two processes sharing a display
+/// name, while older servers simply ignore them.
+#[derive(Clone, Serialize)]
+pub struct AgentRegistration {
+    pub name: String,
+    pub display_name: String,
+    pub hostname: String,
+    pub instance_id: String,
+    pub session_id: String,
+    pub arch: String,
+    pub os: String,
+    pub iac_binaries: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {

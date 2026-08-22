@@ -1,14 +1,54 @@
 use std::env;
+use std::fmt;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+/// A token that does not reveal its value through formatting or debug output.
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        validate_token(&value)?;
+        Ok(Self(value))
+    }
+
+    fn from_file(path: &PathBuf) -> Result<Self> {
+        let value = fs::read_to_string(path)
+            .with_context(|| format!("read agent token file {}", path.display()))?;
+        Self::new(value.trim().to_owned()).context("invalid agent token in token file")
+    }
+
+    pub(crate) fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+impl fmt::Display for SecretString {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub address: String,
-    pub token: String,
-    pub name: String,
+    pub token: SecretString,
+    pub token_file: Option<PathBuf>,
+    pub display_name: String,
+    pub hostname: String,
+    pub instance_id: String,
+    pub session_id: String,
     pub data_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub single: bool,
@@ -28,14 +68,20 @@ impl Config {
             .unwrap_or_else(|| "https://terraform.example.com".to_owned())
             .trim_end_matches('/')
             .to_owned();
-        let token = env_value(&["TERRENCE_AGENT_TOKEN", "TFC_AGENT_TOKEN"])
-            .context("TERRENCE_AGENT_TOKEN is required")?;
-        if token.is_empty() {
-            bail!("TERRENCE_AGENT_TOKEN is required");
-        }
-        if !token.is_ascii() || token.chars().any(char::is_control) {
-            bail!("TERRENCE_AGENT_TOKEN must contain only visible ASCII characters");
-        }
+        let token_file =
+            env_value(&["TERRENCE_AGENT_TOKEN_FILE", "TFC_AGENT_TOKEN_FILE"]).map(PathBuf::from);
+        let token = match token_file.as_ref() {
+            Some(path) => SecretString::from_file(path)?,
+            None => {
+                let value = env_value(&["TERRENCE_AGENT_TOKEN", "TFC_AGENT_TOKEN"])
+                    .context("TERRENCE_AGENT_TOKEN or TERRENCE_AGENT_TOKEN_FILE is required")?;
+                SecretString::new(value).map_err(|_| {
+                    anyhow::anyhow!(
+                        "TERRENCE_AGENT_TOKEN must contain only visible ASCII characters"
+                    )
+                })?
+            }
+        };
 
         let data_dir = env_value(&["TERRENCE_AGENT_DATA_DIR", "TFC_AGENT_DATA_DIR"])
             .map(PathBuf::from)
@@ -43,8 +89,15 @@ impl Config {
         let cache_dir = env_value(&["TERRENCE_AGENT_CACHE_DIR", "TFC_AGENT_CACHE_DIR"])
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("cache"));
-        let name = env_value(&["TERRENCE_AGENT_NAME", "TFC_AGENT_NAME"])
-            .unwrap_or_else(default_agent_name);
+        let hostname = env_value(&["TERRENCE_AGENT_HOSTNAME"]).unwrap_or_else(default_agent_name);
+        let display_name = env_value(&[
+            "TERRENCE_AGENT_DISPLAY_NAME",
+            "TERRENCE_AGENT_NAME",
+            "TFC_AGENT_NAME",
+        ])
+        .unwrap_or_else(|| hostname.clone());
+        let instance_id = env_value(&["TERRENCE_AGENT_INSTANCE_ID"]).unwrap_or_else(random_uuid);
+        let session_id = random_uuid();
         let check_interval_ms = parse_u64(
             env_value(&["TERRENCE_AGENT_CHECK_INTERVAL_MS"]).as_deref(),
             2_000,
@@ -71,7 +124,11 @@ impl Config {
         Ok(Self {
             address,
             token,
-            name,
+            token_file,
+            display_name,
+            hostname,
+            instance_id,
+            session_id,
             data_dir,
             cache_dir,
             single: parse_bool(
@@ -88,6 +145,26 @@ impl Config {
             landlock_runner: env_value(&["TERRENCE_LANDLOCK_RUNNER"]).map(PathBuf::from),
         })
     }
+
+    /// Read the current pool token, reloading a mounted token file when one is
+    /// configured.  This makes projected-secret rotation take effect on the
+    /// next request without putting secret values in logs or config snapshots.
+    pub fn current_token(&self) -> Result<SecretString> {
+        match self.token_file.as_ref() {
+            Some(path) => SecretString::from_file(path),
+            None => Ok(self.token.clone()),
+        }
+    }
+}
+
+fn validate_token(value: &str) -> Result<()> {
+    if value.is_empty() {
+        bail!("agent token is empty");
+    }
+    if !value.is_ascii() || value.chars().any(char::is_control) {
+        bail!("agent token must contain only visible ASCII characters");
+    }
+    Ok(())
 }
 
 fn env_value(names: &[&str]) -> Option<String> {
@@ -122,6 +199,31 @@ fn home_dir() -> PathBuf {
 
 fn default_agent_name() -> String {
     env::var("HOSTNAME").unwrap_or_else(|_| "terrence-agent".to_owned())
+}
+
+fn random_uuid() -> String {
+    let mut bytes = rand::random::<[u8; 16]>();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
 }
 
 pub fn architecture() -> &'static str {
@@ -160,6 +262,8 @@ mod tests {
         unsafe {
             std::env::remove_var("TERRENCE_AGENT_CACHE_DIR");
             std::env::remove_var("TFC_AGENT_CACHE_DIR");
+            std::env::remove_var("TERRENCE_AGENT_TOKEN_FILE");
+            std::env::remove_var("TFC_AGENT_TOKEN_FILE");
         }
         let data = std::env::temp_dir().join("terrence-agent-test-data");
         unsafe {
@@ -189,6 +293,8 @@ mod tests {
         unsafe {
             std::env::remove_var("TERRENCE_AGENT_ACCEPT");
             std::env::remove_var("TFC_AGENT_ACCEPT");
+            std::env::remove_var("TERRENCE_AGENT_TOKEN_FILE");
+            std::env::remove_var("TFC_AGENT_TOKEN_FILE");
             std::env::set_var("TERRENCE_AGENT_TOKEN", "tok");
         }
         let config = Config::from_env().unwrap();
@@ -211,6 +317,8 @@ mod tests {
         unsafe {
             std::env::remove_var("TERRENCE_AGENT_LOG_JSON");
             std::env::remove_var("TFC_AGENT_LOG_JSON");
+            std::env::remove_var("TERRENCE_AGENT_TOKEN_FILE");
+            std::env::remove_var("TFC_AGENT_TOKEN_FILE");
             std::env::set_var("TERRENCE_AGENT_TOKEN", "tok");
         }
         let config = Config::from_env().unwrap();
@@ -234,6 +342,61 @@ mod tests {
             "x86_64" => assert_eq!(arch, "amd64"),
             "aarch64" => assert_eq!(arch, "arm64"),
             other => assert_eq!(arch, other),
+        }
+    }
+
+    #[test]
+    fn secret_debug_and_display_are_redacted() {
+        let secret = SecretString::new("super-secret").unwrap();
+        assert_eq!(format!("{secret}"), "[REDACTED]");
+        assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn token_file_is_loaded_and_reloaded() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "first-token\n").unwrap();
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_TOKEN");
+            std::env::remove_var("TFC_AGENT_TOKEN");
+            std::env::set_var("TERRENCE_AGENT_TOKEN_FILE", file.path());
+        }
+        let config = Config::from_env().unwrap();
+        assert_eq!(
+            config.current_token().unwrap().expose_secret(),
+            "first-token"
+        );
+
+        std::fs::write(file.path(), "rotated-token\n").unwrap();
+        assert_eq!(
+            config.current_token().unwrap().expose_secret(),
+            "rotated-token"
+        );
+
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_TOKEN_FILE");
+        }
+    }
+
+    #[test]
+    fn generated_identity_is_uuid_shaped_and_session_is_fresh() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_TOKEN_FILE");
+            std::env::remove_var("TFC_AGENT_TOKEN_FILE");
+            std::env::set_var("TERRENCE_AGENT_TOKEN", "tok");
+            std::env::remove_var("TERRENCE_AGENT_INSTANCE_ID");
+        }
+        let first = Config::from_env().unwrap();
+        let second = Config::from_env().unwrap();
+        assert_eq!(first.instance_id.len(), 36);
+        assert_eq!(first.session_id.len(), 36);
+        assert_ne!(first.instance_id, second.instance_id);
+        assert_ne!(first.session_id, second.session_id);
+        assert_eq!(first.display_name, first.hostname);
+        unsafe {
+            std::env::remove_var("TERRENCE_AGENT_TOKEN");
         }
     }
 }

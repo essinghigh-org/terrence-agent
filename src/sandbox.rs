@@ -210,15 +210,19 @@ pub async fn terminate_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, SecretString};
     use std::time::Duration;
 
     #[test]
     fn discovers_no_runner_without_installation() {
         let config = Config {
             address: "https://example.test".to_owned(),
-            token: "token".to_owned(),
-            name: "agent".to_owned(),
+            token: SecretString::new("token").unwrap(),
+            token_file: None,
+            display_name: "agent".to_owned(),
+            hostname: "agent-host".to_owned(),
+            instance_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+            session_id: "22222222-2222-4222-8222-222222222222".to_owned(),
             data_dir: PathBuf::from("/tmp/agent"),
             cache_dir: PathBuf::from("/tmp/agent/cache"),
             single: false,
