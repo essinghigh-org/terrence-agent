@@ -22,6 +22,7 @@ pub struct AgentRegistration {
     pub arch: String,
     pub os: String,
     pub iac_binaries: Vec<String>,
+    pub accept: String,
 }
 
 pub const MAX_ID_LENGTH: usize = 200;
