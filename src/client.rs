@@ -470,6 +470,9 @@ impl Client {
         }
         let response = builder.send().await.context("send forwarded request")?;
         let status = response.status().as_u16();
+        if !(100..=599).contains(&status) {
+            bail!("forwarded response status is outside HTTP range: {status}");
+        }
         let mut headers = std::collections::HashMap::new();
         for (name, value) in response.headers() {
             let name = name.as_str();
