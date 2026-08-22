@@ -83,8 +83,17 @@ pub struct Client {
     message_index: Arc<AtomicU64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ArtifactUrl(Url);
+
+impl std::fmt::Debug for ArtifactUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("ArtifactUrl")
+            .field(&self.0.path())
+            .finish()
+    }
+}
 
 impl ArtifactUrl {
     pub fn as_url(&self) -> &Url {
@@ -1184,6 +1193,8 @@ mod tests {
         let url = Url::parse("https://objects.example/a.bin?X-Amz-Signature=secret").unwrap();
         assert_eq!(url_label_url(&url), "/a.bin");
         assert_eq!(url_label("not a URL?secret=1"), "<invalid URL>");
+        let artifact = ArtifactUrl(url);
+        assert_eq!(format!("{artifact:?}"), "ArtifactUrl(\"/a.bin\")");
     }
 
     #[test]
