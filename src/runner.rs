@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::archive::{extract_tar_gz, flatten_single_directory, pack_tar_gz};
@@ -42,6 +43,9 @@ use crate::sandbox::{Sandbox, terminate_child};
 use crate::toolchain::{Product, ToolchainResolver};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const JOB_CONTROL_INTERVAL: Duration = Duration::from_secs(5);
+const CANCEL_STATE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const MIN_JOB_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_JOB_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -58,6 +62,8 @@ pub struct Runner {
     sandbox: Sandbox,
     toolchain: ToolchainResolver,
     metrics: Metrics,
+    shutdown: CancellationToken,
+    force_shutdown: CancellationToken,
 }
 
 pub struct JobOutcome {
@@ -69,6 +75,53 @@ struct Preparation {
     config_digest: Option<String>,
     manifest: Option<ProvenanceManifest>,
     manifest_digest: Option<String>,
+}
+
+#[derive(Clone)]
+struct ExecutionControl {
+    remote: CancellationToken,
+    shutdown: CancellationToken,
+    force_shutdown: CancellationToken,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CancelReason {
+    Remote,
+    Shutdown,
+    ForceShutdown,
+}
+
+#[derive(Debug)]
+struct JobCanceled {
+    reason: CancelReason,
+    state: Option<Value>,
+}
+
+impl std::fmt::Display for JobCanceled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self.reason {
+            CancelReason::Remote => "canceled by Terrence",
+            CancelReason::Shutdown => "canceled during agent shutdown",
+            CancelReason::ForceShutdown => "force-canceled during agent shutdown",
+        };
+        write!(formatter, "{reason}")
+    }
+}
+
+impl std::error::Error for JobCanceled {}
+
+impl ExecutionControl {
+    fn reason(&self) -> Option<CancelReason> {
+        if self.force_shutdown.is_cancelled() {
+            Some(CancelReason::ForceShutdown)
+        } else if self.remote.is_cancelled() {
+            Some(CancelReason::Remote)
+        } else if self.shutdown.is_cancelled() {
+            Some(CancelReason::Shutdown)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -138,7 +191,19 @@ impl Runner {
             sandbox,
             toolchain,
             metrics,
+            shutdown: CancellationToken::new(),
+            force_shutdown: CancellationToken::new(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn force_shutdown_token(&self) -> CancellationToken {
+        self.force_shutdown.clone()
     }
 
     async fn await_deadline<T, E, F>(
@@ -159,6 +224,11 @@ impl Runner {
     }
 
     pub async fn run(&self, payload: &AgentJobPayload) -> JobOutcome {
+        let control = ExecutionControl {
+            remote: CancellationToken::new(),
+            shutdown: self.shutdown.clone(),
+            force_shutdown: self.force_shutdown.clone(),
+        };
         let (result, work_dir) = if let Some(workload) = payload.phase.unsupported() {
             (Err(anyhow!("unsupported_workload: {workload}")), None)
         } else if let Err(error) = validate_payload_identifiers(payload) {
@@ -167,7 +237,10 @@ impl Runner {
             match RunDirectory::create(&self.config.data_dir) {
                 Ok(run_directory) => {
                     let work_dir = run_directory.path().to_owned();
-                    (self.run_inner(payload, &work_dir).await, Some(work_dir))
+                    (
+                        self.run_inner(payload, &work_dir, control).await,
+                        Some(work_dir),
+                    )
                 }
                 Err(error) => (Err(error), None),
             }
@@ -178,6 +251,50 @@ impl Runner {
                 work_dir,
             },
             Err(error) => {
+                if let Some(canceled) = error.downcast_ref::<JobCanceled>() {
+                    let mut message = canceled.to_string();
+                    if payload.phase == Phase::Apply {
+                        message.push_str(
+                            "; the apply may have left a Terraform state lock; verify no agent process remains before considering `terraform force-unlock`",
+                        );
+                    }
+                    let state = canceled.state.as_ref().map(Value::to_string);
+                    let json_state_outputs = canceled.state.as_ref().map(state_outputs);
+                    warn!(phase = payload.phase.as_str(), run_id = %payload.data.run_id, reason = %message, "job canceled");
+                    return JobOutcome {
+                        completion: CompletionJob {
+                            status: "canceled",
+                            error: Some(message),
+                            data: CompletionData {
+                                run_id: payload.data.run_id.clone(),
+                                operation: payload.phase.as_str().to_owned(),
+                                has_changes: false,
+                                generated_configuration: false,
+                                resource_additions: None,
+                                resource_changes: None,
+                                resource_destructions: None,
+                                resource_imports: None,
+                                action_failures: 0,
+                                action_invocations: 0,
+                                state: state.clone(),
+                                json_state: state,
+                                json_state_outputs,
+                                provenance_digest: None,
+                                log_incomplete: None,
+                                state_recovered: false,
+                                state_recovery_required: payload.phase == Phase::Apply,
+                                apply_error: None,
+                                state_recovery_error: None,
+                                lifecycle: (payload.phase == Phase::Apply)
+                                    .then(|| "applied_state_recovery_required".to_owned()),
+                                state_digest: None,
+                                state_bytes: None,
+                                state_artifact: None,
+                            },
+                        },
+                        work_dir,
+                    };
+                }
                 let message = format_error(&error);
                 warn!(phase = payload.phase.as_str(), run_id = %payload.data.run_id, error = %message, "job failed");
                 JobOutcome {
@@ -232,8 +349,19 @@ impl Runner {
         result
     }
 
-    async fn run_inner(&self, payload: &AgentJobPayload, work_dir: &Path) -> Result<RunResult> {
+    async fn run_inner(
+        &self,
+        payload: &AgentJobPayload,
+        work_dir: &Path,
+        control: ExecutionControl,
+    ) -> Result<RunResult> {
         validate_payload_identifiers(payload)?;
+        if let Some(reason) = control.reason() {
+            return Err(anyhow::Error::new(JobCanceled {
+                reason,
+                state: None,
+            }));
+        }
         // Parse once so all stages share one monotonic execution deadline.
         // Completion/log delivery remains outside this TTL.
         let deadline = JobDeadline::parse(&payload.data.timeout)?;
@@ -308,7 +436,7 @@ impl Runner {
                 .join("log-spool")
                 .join(&payload.data.run_id),
         );
-        let heartbeat = self.start_heartbeat();
+        let heartbeat = self.start_heartbeat(&payload.job_id, control.remote.clone());
         let mut execution = self
             .execute_phase(
                 payload,
@@ -320,6 +448,7 @@ impl Runner {
                 &preparation,
                 log_stream.writer(),
                 deadline,
+                &control,
             )
             .await;
         heartbeat.abort();
@@ -340,20 +469,38 @@ impl Runner {
         execution
     }
 
-    fn start_heartbeat(&self) -> JoinHandle<()> {
+    fn start_heartbeat(&self, job_id: &str, remote: CancellationToken) -> JoinHandle<()> {
         let client = self.client.clone();
         let metrics = self.metrics.clone();
+        let job_id = job_id.to_owned();
         tokio::spawn(async move {
-            let mut interval = time::interval(HEARTBEAT_INTERVAL);
-            interval.tick().await;
+            let mut interval = time::interval(JOB_CONTROL_INTERVAL);
+            let mut last_liveness = Instant::now();
             loop {
                 interval.tick().await;
-                match client.put_status("busy", None).await {
-                    Ok(()) => metrics.heartbeat_succeeded().await,
-                    Err(error) => {
-                        metrics.heartbeat_failed();
-                        warn!(error = %error, "agent heartbeat failed");
+                match client.job_status(&job_id).await {
+                    Ok(status) if status.canceled => {
+                        remote.cancel();
+                        return;
                     }
+                    Ok(_) => {}
+                    Err(error) => warn!(error = %error, "job cancellation poll failed"),
+                }
+                if last_liveness.elapsed() >= HEARTBEAT_INTERVAL {
+                    match time::timeout(HEARTBEAT_REQUEST_TIMEOUT, client.put_status("busy", None))
+                        .await
+                    {
+                        Ok(Ok(())) => metrics.heartbeat_succeeded().await,
+                        Ok(Err(error)) => {
+                            metrics.heartbeat_failed();
+                            warn!(error = %error, "agent heartbeat failed");
+                        }
+                        Err(_) => {
+                            metrics.heartbeat_failed();
+                            warn!("agent heartbeat timed out");
+                        }
+                    }
+                    last_liveness = Instant::now();
                 }
             }
         })
@@ -465,6 +612,7 @@ impl Runner {
         preparation: &Preparation,
         log_writer: LogWriter,
         deadline: JobDeadline,
+        control: &ExecutionControl,
     ) -> Result<RunResult> {
         match &payload.phase {
             Phase::Plan => {
@@ -486,6 +634,7 @@ impl Runner {
                         environment,
                         &log_writer,
                         deadline,
+                        control,
                     )
                     .await
                     .context("run terraform init")?;
@@ -543,6 +692,7 @@ impl Runner {
                         environment,
                         &log_writer,
                         deadline,
+                        control,
                     )
                     .await
                     .context("run terraform plan")?;
@@ -565,6 +715,7 @@ impl Runner {
                         work_dir,
                         environment,
                         deadline,
+                        control,
                     )
                     .await
                     .context("capture terraform plan JSON")?;
@@ -596,6 +747,7 @@ impl Runner {
                         work_dir,
                         environment,
                         deadline,
+                        control,
                     )
                     .await
                 {
@@ -737,12 +889,54 @@ impl Runner {
                             environment,
                             &log_writer,
                             deadline,
+                            control,
                         )
                         .await;
                     let apply_error = match result {
                         Ok(true) => None,
                         Ok(false) => Some("terraform apply failed".to_owned()),
-                        Err(error) => Some(format_error(&error)),
+                        Err(error) => {
+                            if let Some(canceled) = error.downcast_ref::<JobCanceled>() {
+                                let state = if canceled.reason == CancelReason::ForceShutdown {
+                                    None
+                                } else {
+                                    let recovery_control = ExecutionControl {
+                                        remote: CancellationToken::new(),
+                                        shutdown: CancellationToken::new(),
+                                        force_shutdown: CancellationToken::new(),
+                                    };
+                                    self.capture_json(
+                                        binary,
+                                        &["state", "pull"],
+                                        exec_dir,
+                                        work_dir,
+                                        environment,
+                                        JobDeadline {
+                                            deadline: Instant::now() + CANCEL_STATE_TIMEOUT,
+                                        },
+                                        &recovery_control,
+                                    )
+                                    .await
+                                    .ok()
+                                };
+                                if !marker.is_file() {
+                                    if let Err(marker_error) =
+                                        persist_apply_marker(&marker, Some(&format_error(&error)))
+                                    {
+                                        warn!(
+                                            path = %marker.display(),
+                                            error = %marker_error,
+                                            "failed to persist canceled apply marker"
+                                        );
+                                    }
+                                }
+                                return Err(anyhow::Error::new(JobCanceled {
+                                    reason: canceled.reason,
+                                    state,
+                                }));
+                            }
+                            Some(format_error(&error))
+                        }
                     };
                     if let Err(error) = persist_apply_marker(&marker, apply_error.as_deref()) {
                         warn!(
@@ -774,14 +968,21 @@ impl Runner {
                         environment,
                         deadline,
                         &state_path,
+                        control,
                     )
-                    .await
-                    .unwrap_or_else(|error| StateCapture {
+                    .await;
+                let state_capture = match state_capture {
+                    Ok(capture) => capture,
+                    Err(error) if error.downcast_ref::<JobCanceled>().is_some() => {
+                        return Err(error);
+                    }
+                    Err(error) => StateCapture {
                         command_error: Some(format_error(&error)),
                         bytes: fs::metadata(&state_path)
                             .map(|metadata| metadata.len())
                             .unwrap_or(0),
-                    });
+                    },
+                };
                 let state_recovered =
                     state_capture.bytes > 0 && validate_state_file(&state_path).is_ok();
                 let state_recovery_error = state_capture.command_error.clone();
@@ -1060,7 +1261,14 @@ impl Runner {
         environment: &[(String, String)],
         logs: &LogWriter,
         deadline: JobDeadline,
+        control: &ExecutionControl,
     ) -> Result<bool> {
+        if let Some(reason) = control.reason() {
+            return Err(anyhow::Error::new(JobCanceled {
+                reason,
+                state: None,
+            }));
+        }
         let mut command =
             self.sandbox
                 .choose_command(&self.config, binary, args, cwd, work_dir, environment)?;
@@ -1070,12 +1278,36 @@ impl Runner {
         let stdout_task = tokio::spawn(read_to_log(stdout, logs.clone()));
         let stderr_task = tokio::spawn(read_to_log(stderr, logs.clone()));
         let timeout = deadline.remaining("IaC command")?;
-        let status = match time::timeout(timeout, child.wait()).await {
-            Ok(status) => status.context("wait for IaC command")?,
-            Err(_) => {
+        enum WaitOutcome {
+            Exited(std::process::ExitStatus),
+            Canceled(CancelReason),
+            TimedOut,
+        }
+        let outcome = tokio::select! {
+            status = child.wait() => match status {
+                Ok(status) => WaitOutcome::Exited(status),
+                Err(error) => return Err(anyhow!("wait for IaC command: {error}")),
+            },
+            _ = control.force_shutdown.cancelled() => WaitOutcome::Canceled(CancelReason::ForceShutdown),
+            _ = control.remote.cancelled() => WaitOutcome::Canceled(CancelReason::Remote),
+            _ = control.shutdown.cancelled() => WaitOutcome::Canceled(CancelReason::Shutdown),
+            _ = time::sleep(timeout) => WaitOutcome::TimedOut,
+        };
+        let status = match outcome {
+            WaitOutcome::Exited(status) => status,
+            WaitOutcome::Canceled(reason) => {
                 terminate_child(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
+                drain_task(stdout_task, "stdout reader").await;
+                drain_task(stderr_task, "stderr reader").await;
+                return Err(anyhow::Error::new(JobCanceled {
+                    reason,
+                    state: None,
+                }));
+            }
+            WaitOutcome::TimedOut => {
+                terminate_child(&mut child).await;
+                drain_task(stdout_task, "stdout reader").await;
+                drain_task(stderr_task, "stderr reader").await;
                 bail!("IaC command exceeded the job execution deadline");
             }
         };
@@ -1094,7 +1326,14 @@ impl Runner {
         environment: &[(String, String)],
         deadline: JobDeadline,
         output_path: &Path,
+        control: &ExecutionControl,
     ) -> Result<StateCapture> {
+        if let Some(reason) = control.reason() {
+            return Err(anyhow::Error::new(JobCanceled {
+                reason,
+                state: None,
+            }));
+        }
         let owned_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let mut command = self.sandbox.choose_command(
             &self.config,
@@ -1115,15 +1354,36 @@ impl Runner {
         let stderr_task = tokio::spawn(read_limited_async(stderr, 1 << 20));
         let timeout = deadline.remaining("Terraform state pull")?;
         let mut command_error = None;
-        let status = match time::timeout(timeout, child.wait()).await {
-            Ok(status) => match status {
+        enum WaitOutcome {
+            Exited(std::io::Result<std::process::ExitStatus>),
+            Canceled(CancelReason),
+            TimedOut,
+        }
+        let outcome = tokio::select! {
+            status = child.wait() => WaitOutcome::Exited(status),
+            _ = control.force_shutdown.cancelled() => WaitOutcome::Canceled(CancelReason::ForceShutdown),
+            _ = control.remote.cancelled() => WaitOutcome::Canceled(CancelReason::Remote),
+            _ = control.shutdown.cancelled() => WaitOutcome::Canceled(CancelReason::Shutdown),
+            _ = time::sleep(timeout) => WaitOutcome::TimedOut,
+        };
+        let status = match outcome {
+            WaitOutcome::Exited(status) => match status {
                 Ok(status) => Some(status),
                 Err(error) => {
                     command_error = Some(format!("wait for terraform state pull: {error}"));
                     None
                 }
             },
-            Err(_) => {
+            WaitOutcome::Canceled(reason) => {
+                terminate_child(&mut child).await;
+                drain_task(stdout_task, "state stdout reader").await;
+                drain_task(stderr_task, "state stderr reader").await;
+                return Err(anyhow::Error::new(JobCanceled {
+                    reason,
+                    state: None,
+                }));
+            }
+            WaitOutcome::TimedOut => {
                 terminate_child(&mut child).await;
                 command_error =
                     Some("terraform state pull exceeded the job execution deadline".to_owned());
@@ -1161,6 +1421,7 @@ impl Runner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn capture_json(
         &self,
         binary: &Path,
@@ -1169,7 +1430,14 @@ impl Runner {
         work_dir: &Path,
         environment: &[(String, String)],
         deadline: JobDeadline,
+        control: &ExecutionControl,
     ) -> Result<Value> {
+        if let Some(reason) = control.reason() {
+            return Err(anyhow::Error::new(JobCanceled {
+                reason,
+                state: None,
+            }));
+        }
         let owned_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let mut command = self.sandbox.choose_command(
             &self.config,
@@ -1185,12 +1453,36 @@ impl Runner {
         let stdout_task = tokio::spawn(read_limited_async(stdout, MAX_CAPTURE_BYTES));
         let stderr_task = tokio::spawn(read_limited_async(stderr, 1 << 20));
         let timeout = deadline.remaining("JSON capture command")?;
-        let status = match time::timeout(timeout, child.wait()).await {
-            Ok(status) => status.context("wait for JSON capture command")?,
-            Err(_) => {
+        enum WaitOutcome {
+            Exited(std::process::ExitStatus),
+            Canceled(CancelReason),
+            TimedOut,
+        }
+        let outcome = tokio::select! {
+            status = child.wait() => match status {
+                Ok(status) => WaitOutcome::Exited(status),
+                Err(error) => return Err(anyhow!("wait for JSON capture command: {error}")),
+            },
+            _ = control.force_shutdown.cancelled() => WaitOutcome::Canceled(CancelReason::ForceShutdown),
+            _ = control.remote.cancelled() => WaitOutcome::Canceled(CancelReason::Remote),
+            _ = control.shutdown.cancelled() => WaitOutcome::Canceled(CancelReason::Shutdown),
+            _ = time::sleep(timeout) => WaitOutcome::TimedOut,
+        };
+        let status = match outcome {
+            WaitOutcome::Exited(status) => status,
+            WaitOutcome::Canceled(reason) => {
                 terminate_child(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
+                drain_task(stdout_task, "JSON stdout reader").await;
+                drain_task(stderr_task, "JSON stderr reader").await;
+                return Err(anyhow::Error::new(JobCanceled {
+                    reason,
+                    state: None,
+                }));
+            }
+            WaitOutcome::TimedOut => {
+                terminate_child(&mut child).await;
+                drain_task(stdout_task, "JSON stdout reader").await;
+                drain_task(stderr_task, "JSON stderr reader").await;
                 bail!("JSON capture command exceeded the job execution deadline");
             }
         };
@@ -1721,6 +2013,20 @@ fn format_error(error: &anyhow::Error) -> String {
     error.to_string().chars().take(2_000).collect()
 }
 
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn drain_task<T>(task: JoinHandle<Result<T>>, name: &str) {
+    match time::timeout(READER_DRAIN_TIMEOUT, task).await {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(error))) => warn!(reader = name, error = %error, "command output reader failed"),
+        Ok(Err(error)) => warn!(reader = name, error = %error, "command output reader panicked"),
+        Err(_) => warn!(
+            reader = name,
+            "command output reader did not drain before timeout"
+        ),
+    }
+}
+
 async fn read_to_log<R>(mut reader: R, logs: LogWriter) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -1803,6 +2109,20 @@ mod tests {
             parse_job_timeout("9999999999999999999h").unwrap(),
             MAX_JOB_TIMEOUT
         );
+    }
+
+    #[test]
+    fn force_shutdown_takes_priority_over_other_cancellation() {
+        let control = ExecutionControl {
+            remote: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            force_shutdown: CancellationToken::new(),
+        };
+        control.remote.cancel();
+        control.shutdown.cancel();
+        assert_eq!(control.reason(), Some(CancelReason::Remote));
+        control.force_shutdown.cancel();
+        assert_eq!(control.reason(), Some(CancelReason::ForceShutdown));
     }
 
     #[test]

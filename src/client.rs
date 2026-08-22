@@ -35,6 +35,7 @@ const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(130);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(15);
+const JOB_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ARTIFACT_ATTEMPTS: usize = 3;
@@ -81,6 +82,8 @@ pub enum ClientError {
         #[source]
         source: std::io::Error,
     },
+    #[error("invalid job id for {path}")]
+    InvalidPath { path: String },
 }
 
 #[derive(Clone)]
@@ -114,6 +117,12 @@ impl ArtifactUrl {
     pub fn as_url(&self) -> &Url {
         &self.0
     }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct JobStatus {
+    #[serde(default)]
+    pub canceled: bool,
 }
 
 impl Client {
@@ -244,6 +253,25 @@ impl Client {
             .json(&body);
         let _: Value = self.send_json(request, "/api/agent/status").await?;
         Ok(())
+    }
+
+    pub async fn job_status(&self, job_id: &str) -> Result<JobStatus, ClientError> {
+        if job_id.is_empty()
+            || !job_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ClientError::InvalidPath {
+                path: job_id.to_owned(),
+            });
+        }
+        let path = format!("/api/agent/jobs/{job_id}/status");
+        let request = self
+            .control_http
+            .get(self.api_url(&path))
+            .headers(self.agent_headers().await?)
+            .timeout(JOB_CONTROL_TIMEOUT);
+        self.send_json(request, &path).await
     }
 
     pub async fn deregister(&self) -> Result<(), ClientError> {
@@ -1547,5 +1575,14 @@ mod tests {
             .await;
 
         assert!(client.forward_once().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn job_status_rejects_path_injection() {
+        let client = Client::new(config("https://terrence.example".to_owned())).unwrap();
+        assert!(matches!(
+            client.job_status("job/../../status").await,
+            Err(ClientError::InvalidPath { .. })
+        ));
     }
 }
