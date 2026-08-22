@@ -208,8 +208,7 @@ impl Runner {
                 )
                 .await;
         }
-        let environment =
-            execution_environment(payload, container, work_dir, self.config.sandbox)?;
+        let environment = execution_environment(payload, container, work_dir, self.config.sandbox)?;
         let log_stream =
             LogStream::new(self.client.clone(), payload.data.terraform_log_url.clone());
         let heartbeat = self.start_heartbeat();
