@@ -149,14 +149,6 @@ impl Journal {
         self.update(entry, JournalState::CleanupDone, None)
     }
 
-    pub fn for_job(&self, job_id: &str) -> Result<Option<JournalEntry>> {
-        let path = self.path_for_job(job_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        self.read(&path).map(Some)
-    }
-
     /// Return records that still need a control-plane acknowledgement or local
     /// cleanup. This is intentionally a small directory scan: one job produces
     /// one record, and avoiding an index keeps recovery atomic and boring.
@@ -332,7 +324,7 @@ mod tests {
         assert_eq!(pending.completion().unwrap().status, "finished");
 
         let reopened = Journal::open(directory.path()).unwrap();
-        let loaded = reopened.for_job("job-1").unwrap().unwrap();
+        let loaded = reopened.unfinished().unwrap().into_iter().next().unwrap();
         assert_eq!(loaded.state, JournalState::CompletionPending);
         assert_eq!(loaded.completion().unwrap().data.run_id, "run-1");
 
