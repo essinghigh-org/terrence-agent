@@ -825,6 +825,14 @@ impl RunDirectory {
 
     async fn cleanup_path(data_dir: &Path, path: &Path) -> Result<()> {
         let runs = data_dir.join("runs");
+        match fs::symlink_metadata(&runs) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refusing to clean through a symlinked runs directory")
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
         let root = fs::canonicalize(&runs)
             .with_context(|| format!("resolve run directory {}", runs.display()))?;
         let run_directory = Self {
