@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.85"
 description = "A sandboxed Terraform/OpenTofu execution agent for Terrence"
 license = "Apache-2.0"
+repository = "https://github.com/essinghigh-org/terrence-agent"
+readme = "README.md"
+keywords = ["terraform", "opentofu", "agent", "landlock"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

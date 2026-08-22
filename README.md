@@ -179,6 +179,12 @@ docker build \
   -t terrence-agent:local .
 ```
 
+If either version changes, pass the matching architecture-specific SHA-256
+arguments (`TERRAFORM_SHA256_AMD64`, `TERRAFORM_SHA256_ARM64`,
+`TOFU_SHA256_AMD64`, and `TOFU_SHA256_ARM64`). The image build rejects an
+unlisted release rather than trusting a checksum manifest fetched at build
+time.
+
 ## Design choices
 
 - Rust 2024 with Tokio for HTTP, cancellation, heartbeats, and subprocesses.
