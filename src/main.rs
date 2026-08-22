@@ -29,6 +29,7 @@ use protocol::CompletionJob;
 use runner::Runner;
 use tokio::sync::Notify;
 use tokio::time;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -71,15 +72,29 @@ async fn main() -> Result<()> {
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let force_exit = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(Notify::new());
     let signal_shutdown = Arc::clone(&shutdown);
+    let signal_force_exit = Arc::clone(&force_exit);
     let signal_notify = Arc::clone(&shutdown_notify);
+    let runner_shutdown = runner.shutdown_token();
+    let runner_force_shutdown = runner.force_shutdown_token();
     tokio::spawn(async move {
-        wait_for_shutdown(signal_shutdown, signal_notify).await;
+        wait_for_shutdown(
+            signal_shutdown,
+            signal_force_exit,
+            signal_notify,
+            runner_shutdown,
+            runner_force_shutdown,
+        )
+        .await;
     });
 
     if !register_with_retry(&client, &metrics, &shutdown, &shutdown_notify).await? {
         info!("shutdown requested before registration completed");
+        if force_exit.load(Ordering::SeqCst) {
+            bail!("forced shutdown requested");
+        }
         return Ok(());
     }
     info!(
@@ -166,6 +181,9 @@ async fn main() -> Result<()> {
     if let Err(error) = client.deregister().await {
         warn!(error = %error, "agent deregistration failed during shutdown");
     }
+    if force_exit.load(Ordering::SeqCst) {
+        bail!("forced shutdown requested");
+    }
     info!("terrence-agent stopped");
     Ok(())
 }
@@ -185,12 +203,17 @@ async fn forwarding_loop(client: Client, shutdown: Arc<AtomicBool>, interval: Du
 
 /// Wait for a termination signal and request a graceful shutdown.
 ///
-/// The first signal sets `shutdown`, letting the agent finish its current job
-/// before exiting (matching the tfc-agent graceful-drain contract). A second
-/// signal forces an immediate exit, mirroring upstream behavior under a tight
-/// shutdown deadline.
+/// The first signal sets `shutdown`, cancels the active subprocess, and stops
+/// polling. A second signal escalates the active process group to force
+/// termination and causes a non-success exit after deregistration.
 #[cfg(unix)]
-async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, notify: Arc<Notify>) {
+async fn wait_for_shutdown(
+    shutdown: Arc<AtomicBool>,
+    force_exit: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    runner_shutdown: CancellationToken,
+    runner_force_shutdown: CancellationToken,
+) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigint = signal(SignalKind::interrupt()).expect("install SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
@@ -204,21 +227,32 @@ async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, notify: Arc<Notify>) {
         }
         if first {
             first = false;
-            info!("shutdown signal received; finishing the current job before exiting");
+            info!("shutdown signal received; canceling the current job before exiting");
             shutdown.store(true, Ordering::SeqCst);
+            runner_shutdown.cancel();
             notify.notify_one();
         } else {
-            warn!("second termination signal received; forcing immediate exit");
-            std::process::exit(1);
+            warn!("second termination signal received; forcing job termination");
+            force_exit.store(true, Ordering::SeqCst);
+            runner_force_shutdown.cancel();
+            notify.notify_one();
+            return;
         }
     }
 }
 
 #[cfg(not(unix))]
-async fn wait_for_shutdown(shutdown: Arc<AtomicBool>, notify: Arc<Notify>) {
+async fn wait_for_shutdown(
+    shutdown: Arc<AtomicBool>,
+    _force_exit: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+    runner_shutdown: CancellationToken,
+    _runner_force_shutdown: CancellationToken,
+) {
     let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received; finishing the current job before exiting");
+    info!("shutdown signal received; canceling the current job before exiting");
     shutdown.store(true, Ordering::SeqCst);
+    runner_shutdown.cancel();
     notify.notify_one();
 }
 
