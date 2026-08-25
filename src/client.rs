@@ -1248,8 +1248,21 @@ fn literal_ip(host: &str) -> Option<IpAddr> {
 }
 
 fn is_metadata_ip(ip: IpAddr) -> bool {
-    matches!(ip, IpAddr::V4(ip) if ip.octets() == [169, 254, 169, 254])
-        || matches!(ip, IpAddr::V6(ip) if ip.to_ipv4().is_some_and(|ip| ip.octets() == [169, 254, 169, 254]))
+    // AWS/GCP/Azure/OpenStack: 169.254.169.254 (plus the IPv6 form AWS maps
+    // to fd00:ec2::25). Alibaba Cloud serves instance metadata at
+    // 100.100.100.200, which sits inside the shared-CGNAT range and needs its
+    // own explicit entry — private_ip_reason alone does not run on paths that
+    // allow private addresses.
+    let octets = |ip: &IpAddr| -> Option<[u8; 4]> {
+        match ip {
+            IpAddr::V4(v4) => Some(v4.octets()),
+            IpAddr::V6(v6) => v6.to_ipv4().map(|v4| v4.octets()),
+        }
+    };
+    matches!(
+        octets(&ip),
+        Some([169, 254, 169, 254] | [100, 100, 100, 200])
+    )
 }
 
 fn private_ip_reason(ip: IpAddr) -> Option<&'static str> {
@@ -1594,6 +1607,7 @@ mod tests {
     fn private_host_policy_catches_literal_and_mapped_addresses() {
         for value in [
             "https://169.254.169.254/latest/meta-data/",
+            "https://100.100.100.200/latest/meta-data/",
             "https://127.0.0.1/",
             "https://[::1]/",
             "https://[::ffff:127.0.0.1]/",
@@ -1604,6 +1618,22 @@ mod tests {
                 literal_private_host_reason(&url).is_some(),
                 "expected {value} to be classified as private"
             );
+        }
+    }
+
+    #[test]
+    fn metadata_ip_classification_covers_all_major_clouds() {
+        // The forwarded-request path allows private addresses but never cloud
+        // metadata endpoints, so is_metadata_ip must know every major cloud.
+        for (value, expected) in [
+            ("169.254.169.254", true), // AWS/GCP/Azure/OpenStack
+            ("fd00:ec2::25", false),   // AWS IPv6 slot is a distinct address
+            ("100.100.100.200", true), // Alibaba Cloud
+            ("8.8.8.8", false),
+            ("192.168.1.10", false),
+        ] {
+            let ip: IpAddr = value.parse().unwrap();
+            assert_eq!(is_metadata_ip(ip), expected, "mismatch for {value}");
         }
     }
 
