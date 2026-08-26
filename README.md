@@ -7,7 +7,6 @@ a Linux Landlock filesystem sandbox.
 Terrence provides a Terraform-compatible remote execution API. See:
 
 - <https://github.com/essinghigh-org/terrence>
-- <https://terraform.example.com>
 
 The agent is independently implemented. Compatibility means the HTTP protocol,
 not tfc-agent's internal implementation or configuration model.
