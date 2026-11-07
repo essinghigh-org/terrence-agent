@@ -2555,6 +2555,86 @@ mod tests {
         Runner::new(Client::new(config).unwrap())
     }
 
+    #[tokio::test]
+    async fn fresh_unfenced_completion_works_but_restart_never_replays_it() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for live_completion in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/agent/register"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"agent-1", "agent_pool_id":"pool-1"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/api/agent/status"))
+                .and(body_partial_json(
+                    json!({"job":{"data":{"fencing_token":0}}}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(u64::from(live_completion))
+                .mount(&server)
+                .await;
+            let temp = tempdir().unwrap();
+            let mut config = test_runner(temp.path().to_owned()).config.clone();
+            config.address = server.uri();
+            let client = Client::new(config).unwrap();
+            client.register().await.unwrap();
+            let runner = Runner::new(client.clone());
+            let journal = Journal::open(temp.path()).unwrap();
+            let manifest =
+                ExecutionManifest::from_payload(&test_payload("job-1", "run-1")).unwrap();
+            let claimed = journal.start(manifest.clone()).unwrap();
+            let executing = journal.mark_executing(&claimed).unwrap();
+            let completion = CompletionJob {
+                status: "finished",
+                error: None,
+                data: serde_json::from_value(json!({
+                    "fencing_token":0,"run_id":"run-1","operation":"plan",
+                    "has_changes":false,"generated_configuration":false,
+                    "action_failures":0,"action_invocations":0
+                }))
+                .unwrap(),
+            };
+            let pending = journal
+                .record_completion(&executing, &completion, None, false)
+                .unwrap();
+            let entry = if live_completion {
+                pending
+            } else {
+                Journal::open(temp.path())
+                    .unwrap()
+                    .unfinished()
+                    .unwrap()
+                    .remove(0)
+            };
+            crate::finish_journal_entry(
+                &client,
+                &runner,
+                &journal,
+                entry,
+                &Metrics::new(),
+                live_completion,
+            )
+            .await
+            .unwrap();
+            let stored = journal.start(manifest).unwrap();
+            assert_eq!(
+                stored.state,
+                if live_completion {
+                    crate::journal::JournalState::CleanupDone
+                } else {
+                    crate::journal::JournalState::RecoveryRequired
+                }
+            );
+            assert_eq!(stored.completion().is_some(), !live_completion);
+            server.verify().await;
+        }
+    }
+
     fn test_payload(job_id: &str, run_id: &str) -> AgentJobPayload {
         AgentJobPayload {
             phase: Phase::Plan,

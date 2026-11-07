@@ -27,6 +27,9 @@ pub enum JournalState {
     CompletionPending,
     CompletionAcked,
     CleanupDone,
+    /// Side effects lack a replayable lease identity. Preserve the completion
+    /// and local artifacts for operator reconciliation without retrying them.
+    RecoveryRequired,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -85,6 +88,21 @@ pub struct JournalEntry {
 impl JournalEntry {
     pub fn completion(&self) -> Option<&CompletionJob> {
         self.completion.as_ref()
+    }
+
+    /// Unfenced effects must never be relabeled with a newer claim's fence.
+    /// A status endpoint may reject or ignore them, neither of which is an ACK.
+    pub fn needs_unfenced_recovery(&self) -> bool {
+        match self.state {
+            JournalState::Executing => self.manifest.fencing_token == 0,
+            JournalState::CompletionPending => {
+                self.manifest.fencing_token == 0
+                    || self.completion.as_ref().is_some_and(|completion| {
+                        completion.data.fencing_token != Some(self.manifest.fencing_token)
+                    })
+            }
+            _ => false,
+        }
     }
 }
 
@@ -191,6 +209,24 @@ impl Journal {
         self.update(entry, JournalState::CompletionAcked, None)
     }
 
+    /// Stop automatic replay while preserving the original completion and
+    /// workspace. This is deliberately not a control-plane acknowledgement.
+    pub fn quarantine_unfenced(&self, entry: &JournalEntry) -> Result<JournalEntry> {
+        if !entry.needs_unfenced_recovery() {
+            bail!("only unfenced execution records may be quarantined");
+        }
+        let mut retained = entry.clone();
+        retained.retain_work_dir = true;
+        self.update(
+            &retained,
+            JournalState::RecoveryRequired,
+            entry
+                .completion
+                .as_ref()
+                .map(StoredCompletion::from_completion),
+        )
+    }
+
     pub fn mark_cleanup_done(&self, entry: &JournalEntry) -> Result<JournalEntry> {
         // The control-plane ACK makes the completion payload disposable. Keep
         // only the manifest/fingerprint so a duplicate claim cannot execute.
@@ -220,7 +256,9 @@ impl Journal {
             .filter(|entry| {
                 if matches!(
                     entry.state,
-                    JournalState::Claimed | JournalState::CleanupDone
+                    JournalState::Claimed
+                        | JournalState::CleanupDone
+                        | JournalState::RecoveryRequired
                 ) {
                     return false;
                 }
@@ -411,6 +449,113 @@ mod tests {
                 state_artifact: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn unfenced_effects_are_retained_without_replay_cleanup_or_reexecution() {
+        for pending in [false, true] {
+            let directory = tempdir().unwrap();
+            let journal = Journal::open(directory.path()).unwrap();
+            let mut old = manifest(directory.path());
+            old.fencing_token = 0;
+            old.fingerprint = "released-fingerprint".to_owned();
+            let work_dir = old.work_dir.as_ref().unwrap();
+            fs::create_dir_all(work_dir).unwrap();
+            fs::write(work_dir.join("terraform.tfstate"), "retained-state").unwrap();
+            let claimed = journal.start(old.clone()).unwrap();
+            let mut entry = journal.mark_executing(&claimed).unwrap();
+            if pending {
+                entry = journal
+                    .record_completion(&entry, &completion(), old.work_dir.clone(), false)
+                    .unwrap();
+            }
+            // A nonregistered client cannot acknowledge completion. Recovery
+            // must return without any network submission or directory cleanup.
+            let client = crate::client::Client::new(crate::config::Config {
+                address: "https://example.test".to_owned(),
+                token: crate::config::SecretString::new("test-token").unwrap(),
+                token_file: None,
+                display_name: "test".to_owned(),
+                hostname: "test".to_owned(),
+                instance_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+                session_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                data_dir: directory.path().to_owned(),
+                cache_dir: directory.path().join("cache"),
+                single: false,
+                sandbox: false,
+                check_interval: Duration::from_secs(1),
+                log_level: "info".to_owned(),
+                log_json: false,
+                accept: "plan,apply".to_owned(),
+                max_parallelism: 64,
+                terraform_path: None,
+                tofu_path: None,
+                landlock_runner: None,
+            })
+            .unwrap();
+            let runner = crate::runner::Runner::new(client.clone());
+            crate::finish_journal_entry(
+                &client,
+                &runner,
+                &journal,
+                entry,
+                &crate::observability::Metrics::new(),
+                false,
+            )
+            .await
+            .unwrap();
+            let reopened = Journal::open(directory.path()).unwrap();
+            assert!(reopened.unfinished().unwrap().is_empty());
+            let mut redelivery = old.clone();
+            redelivery.fencing_token = 7;
+            redelivery.legacy_fingerprint = Some(old.fingerprint.clone());
+            redelivery.fingerprint = "current-fingerprint".to_owned();
+            let retained = reopened.start(redelivery).unwrap();
+            assert_eq!(retained.state, JournalState::RecoveryRequired);
+            assert_eq!(retained.manifest.fencing_token, 0);
+            assert!(retained.retain_work_dir);
+            assert_eq!(retained.manifest.work_dir, old.work_dir);
+            assert_eq!(retained.completion().is_some(), pending);
+            if pending {
+                assert_eq!(
+                    retained.completion().unwrap().data.state.as_deref(),
+                    Some("{}")
+                );
+                assert_eq!(retained.completion().unwrap().data.fencing_token, None);
+            }
+            assert_eq!(
+                fs::read_to_string(work_dir.join("terraform.tfstate")).unwrap(),
+                "retained-state"
+            );
+            // Quarantine is terminal for this job, not for unrelated claims.
+            let mut unrelated = manifest(directory.path());
+            unrelated.job_id = "another-job".to_owned();
+            assert_eq!(
+                reopened.start(unrelated).unwrap().state,
+                JournalState::Claimed
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_completion_is_replayable_only_with_its_original_lease() {
+        let directory = tempdir().unwrap();
+        let journal = Journal::open(directory.path()).unwrap();
+        let claimed = journal.start(manifest(directory.path())).unwrap();
+        let executing = journal.mark_executing(&claimed).unwrap();
+        assert!(!executing.needs_unfenced_recovery());
+        assert!(journal.quarantine_unfenced(&executing).is_err());
+        let mut finished = completion();
+        finished.data.fencing_token = Some(1);
+        let pending = journal
+            .record_completion(&executing, &finished, None, false)
+            .unwrap();
+        assert!(!pending.needs_unfenced_recovery());
+        finished.data.fencing_token = Some(2);
+        let mismatched = journal
+            .record_completion(&executing, &finished, None, false)
+            .unwrap();
+        assert!(mismatched.needs_unfenced_recovery());
     }
 
     #[test]

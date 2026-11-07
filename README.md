@@ -113,6 +113,17 @@ After abrupt native-agent death, restart preserves the journal's `work_dir` and 
 
 Use the actual journaled fencing token. Recovery preserves the run's errored status and releases the workspace lock only after state publication. Keep larger states and the local directory for the existing operator state-recovery workflow; ordinary inline capture is bounded to 8 MiB. This recovery completion was qualified with all 200 resources retained after an actual process kill. No interrupted apply is automatically requeued.
 
+A replayed legacy journal entry that already started execution but lacks a
+matching fencing token is quarantined locally as `recovery_required`. This also
+applies after a failed live completion delivery, even without a restart. Its
+original completion and work directory are retained for operator reconciliation;
+the agent neither submits them under a newer lease nor treats an ignored status
+update as an acknowledgement. It can continue polling other jobs, but redelivery
+of the quarantined job never executes it again. Reconcile the original run and
+state with the server before manually recovering or unlocking its workspace.
+Fresh non-native completions against older servers still use their original
+unfenced contract; only automatic replay is quarantined.
+
 ## Diagnostics
 
 The binary has local, offline-friendly checks for deployment support:

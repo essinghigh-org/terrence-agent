@@ -288,7 +288,7 @@ async fn poll_once(
     }
     metrics.poll_started();
     if let Some(entry) = journal.unfinished()?.into_iter().next() {
-        finish_journal_entry(client, runner, journal, entry, metrics).await?;
+        finish_journal_entry(client, runner, journal, entry, metrics, false).await?;
         return Ok(PollResult::Idle);
     }
     let claim = tokio::select! {
@@ -318,7 +318,7 @@ async fn poll_once(
     let manifest = ExecutionManifest::from_payload(&payload)?;
     let journal_entry = journal.start(manifest)?;
     if journal_entry.state != JournalState::Claimed {
-        finish_journal_entry(client, runner, journal, journal_entry, metrics).await?;
+        finish_journal_entry(client, runner, journal, journal_entry, metrics, false).await?;
         return Ok(PollResult::Idle);
     }
     let journal_entry = journal.mark_executing(&journal_entry)?;
@@ -339,7 +339,8 @@ async fn poll_once(
         Some(&payload.data.run_id),
         Some(payload.phase.as_str()),
     );
-    let finish_result = finish_journal_entry(client, runner, journal, journal_entry, metrics).await;
+    let finish_result =
+        finish_journal_entry(client, runner, journal, journal_entry, metrics, true).await;
     metrics.job_finished(completion_status == "finished");
     metrics.clear_job().await;
     finish_result?;
@@ -384,7 +385,27 @@ async fn finish_journal_entry(
     journal: &Journal,
     entry: JournalEntry,
     metrics: &Metrics,
+    live_completion: bool,
 ) -> Result<()> {
+    // Older servers may omit fencing even for newly claimed work. Its live
+    // completion can use that original contract, but a restart/redelivery may
+    // never assume that an old unfenced lease is still authoritative.
+    let live_legacy_completion = live_completion
+        && !entry.manifest.native_policy
+        && entry.manifest.fencing_token == 0
+        && entry
+            .completion()
+            .is_some_and(|completion| completion.data.fencing_token == Some(0));
+    if entry.needs_unfenced_recovery() && !live_legacy_completion {
+        let retained = journal.quarantine_unfenced(&entry)?;
+        error!(
+            job_id = %retained.manifest.job_id,
+            run_id = %retained.manifest.run_id,
+            work_dir = ?retained.manifest.work_dir,
+            "unfenced execution requires operator reconciliation; original completion and state retained, not replayed or acknowledged"
+        );
+        return Ok(());
+    }
     let entry = match entry.state {
         JournalState::CompletionPending => {
             let completion = entry
@@ -402,7 +423,7 @@ async fn finish_journal_entry(
             journal.mark_completion_acked(&entry)?
         }
         JournalState::CompletionAcked => entry,
-        JournalState::CleanupDone => return Ok(()),
+        JournalState::CleanupDone | JournalState::RecoveryRequired => return Ok(()),
         JournalState::Claimed | JournalState::Executing => {
             // A process restart can leave only the execution marker behind.
             // Never replay the stale claim. A native apply retains its local
