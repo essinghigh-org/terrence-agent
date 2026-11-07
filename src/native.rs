@@ -634,6 +634,9 @@ impl NativeSession {
             .cloned()
             .collect()
     }
+    // Keep the command, filesystem boundary and cancellation inputs explicit,
+    // matching the runner's existing command-execution interface.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stage(
         &mut self,
         command: &str,
