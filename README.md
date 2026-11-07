@@ -45,6 +45,7 @@ for an unsupported IaC binary.
 | `TERRENCE_AGENT_CACHE_DIR` | `<data_dir>/cache` | IaC binary cache (separate from run data) |
 | `TERRENCE_AGENT_SINGLE` | `false` | Claim one job and exit |
 | `TERRENCE_AGENT_SANDBOX` | `true` | Require Landlock for IaC commands |
+| `TERRENCE_AGENT_NATIVE_POLICY_PROFILE` | unset | Canonical read-only profile for opt-in native tfpolicy execution |
 | `TERRENCE_AGENT_SANDBOX_PROFILE` | `compatibility` | `strict`, `provisioner`, or compatibility profile |
 | `TERRENCE_AGENT_CHECK_INTERVAL_MS` | `2000` | Empty-pool polling floor |
 | `TERRENCE_AGENT_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, or `error` |
@@ -79,6 +80,16 @@ Landlock ABI 1 and keeps common provider paths readable. Set
 
 The local `/doctor` endpoint is a non-failing health snapshot; use the
 `terrence-agent doctor` CLI command for the full diagnostic checks.
+
+## Native policy
+
+Native tfpolicy execution requires the matching Terrence server update and an operator-supplied licensed plugin. Follow the server's [native runtime setup](https://github.com/essinghigh-org/terrence/blob/fix/tfpolicy-execution/tools/tfpolicy-engine/HANDOFF.md), then set `TERRENCE_AGENT_NATIVE_POLICY_PROFILE` to that JSON profile shape on the agent host. Keep `TERRENCE_AGENT_SANDBOX=true`. Linux Landlock ABI 6, zero capabilities, disabled core dumps and an already delegated cgroup with finite PID/memory limits are required. The shipped service/container examples do not establish cgroup delegation automatically.
+
+The owner and runtime bytes must match the server's pins; paths may differ. Native jobs use the pinned strict Terraform 1.17.1 engine. `runtime.runner` is the native helper built by the server repository; `TERRENCE_LANDLOCK_RUNNER` remains this repository's helper for state capture. Registration checks both paths before offering `operation.native-policy.v2`. An invalid configured profile stops registration. With no profile, the agent keeps the legacy capability contract.
+
+Frozen policy sources, the private receipt key and owner captures stay outside the IaC directory and filesystem snapshot. The server authenticates the current job/lease, runtime, source, saved plan and plan JSON before accepting native completion. A public CA bundle may be pinned as `runtime.entitlementCA`; it is also used for the agent's HTTPS requests, with certificate validation enabled.
+
+An apply failure can occur after resources change. The agent captures state into separate trusted storage and reports failure without claiming rollback. If completion or state publication fails, it retains the work directory and durable completion journal. An expired or canceled admitted native apply holds the server's workspace lock until state recovery is acknowledged. Stop the old execution and recover its retained state before using the existing operator recovery/force-unlock workflow; the agent does not automatically rerun that apply.
 
 ## Diagnostics
 

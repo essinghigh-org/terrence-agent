@@ -334,6 +334,8 @@ mod tests {
 
     fn manifest(root: &Path) -> ExecutionManifest {
         ExecutionManifest {
+            fencing_token: 1,
+            native_policy: false,
             job_id: "job-1".to_owned(),
             run_id: "run-1".to_owned(),
             phase: "apply".to_owned(),
@@ -347,6 +349,7 @@ mod tests {
             status: "finished",
             error: None,
             data: CompletionData {
+                fencing_token: None,
                 run_id: "run-1".to_owned(),
                 operation: "apply".to_owned(),
                 has_changes: true,

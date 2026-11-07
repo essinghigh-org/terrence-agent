@@ -14,6 +14,10 @@ use crate::protocol::AgentJobPayload;
 /// out of the journal metadata.
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct ExecutionManifest {
+    #[serde(default)]
+    pub fencing_token: u64,
+    #[serde(default)]
+    pub native_policy: bool,
     pub job_id: String,
     pub run_id: String,
     pub phase: String,
@@ -25,6 +29,8 @@ pub struct ExecutionManifest {
 impl ExecutionManifest {
     pub fn from_payload(payload: &AgentJobPayload) -> Result<Self> {
         Ok(Self {
+            fencing_token: payload.data.fencing_token,
+            native_policy: payload.data.native_policy_url.is_some(),
             job_id: payload.job_id.clone(),
             run_id: payload.data.run_id.clone(),
             phase: payload.phase.as_str().to_owned(),
@@ -62,6 +68,8 @@ fn strip_rotating_fields(value: &mut Value) {
                 "terraform_log_url",
                 "json_plan_url",
                 "state_artifact_url",
+                "native_policy_url",
+                "native_result_url",
             ] {
                 values.remove(key);
             }
@@ -121,6 +129,9 @@ mod tests {
             phase: Phase::Plan,
             job_id: "job-1".to_owned(),
             data: JobData {
+                fencing_token: 0,
+                native_policy_url: None,
+                native_result_url: None,
                 organization_name: "org".to_owned(),
                 workspace_name: "workspace".to_owned(),
                 operation: "plan".to_owned(),

@@ -5,6 +5,7 @@ mod diagnostics;
 mod journal;
 mod logs;
 mod manifest;
+mod native;
 mod observability;
 mod protocol;
 mod provenance;
@@ -410,6 +411,7 @@ async fn finish_journal_entry(
                 status: "errored",
                 error: Some("agent restarted before durable completion".to_owned()),
                 data: CompletionData {
+                    fencing_token: Some(entry.manifest.fencing_token),
                     run_id: entry.manifest.run_id.clone(),
                     operation: entry.manifest.phase.clone(),
                     has_changes: false,
@@ -426,7 +428,8 @@ async fn finish_journal_entry(
                     provenance_digest: None,
                     log_incomplete: None,
                     state_recovered: false,
-                    state_recovery_required: false,
+                    state_recovery_required: entry.manifest.native_policy
+                        && entry.manifest.phase == "apply",
                     apply_error: None,
                     state_recovery_error: None,
                     lifecycle: Some("agent_restarted".to_owned()),
