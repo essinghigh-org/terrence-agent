@@ -519,11 +519,16 @@ impl Runner {
             loop {
                 interval.tick().await;
                 match client.job_status_fenced(&job_id, Some(fencing_token)).await {
-                    Ok(status) if status.canceled => {
+                    Ok(status) if status.execution_revoked() => {
                         remote.cancel();
                         return;
                     }
                     Ok(_) => {}
+                    Err(error) if error.execution_revoked() => {
+                        warn!(error = %error, "job authority revoked; stopping execution");
+                        remote.cancel();
+                        return;
+                    }
                     Err(error) => warn!(error = %error, "job cancellation poll failed"),
                 }
                 if last_liveness.elapsed() >= HEARTBEAT_INTERVAL {
@@ -2631,6 +2636,75 @@ mod tests {
                 }
             );
             assert_eq!(stored.completion().is_some(), !live_completion);
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_cancels_revoked_claims_but_keeps_transient_errors_retryable() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (code, body, revoked) in [
+            (200, json!({"status":"claimed","canceled":true}), true),
+            (200, json!({"status":"errored","canceled":false}), true),
+            (200, json!({"status":"completed"}), true),
+            (200, json!({"status":"queued"}), true),
+            (401, json!({"error":"unauthorized"}), true),
+            (403, json!({"error":"forbidden"}), true),
+            (404, json!({"error":"not found"}), true),
+            (409, json!({"error":"stale lease"}), true),
+            (200, json!({"status":"claimed","canceled":false}), false),
+            (429, json!({"error":"retry later"}), false),
+            (503, json!({"error":"unavailable"}), false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/agent/register"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"agent-1", "agent_pool_id":"pool-1"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/agent/jobs/job-1/status"))
+                .and(query_param("fencing_token", "7"))
+                .respond_with(ResponseTemplate::new(code).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let temp = tempdir().unwrap();
+            let mut config = test_runner(temp.path().to_owned()).config.clone();
+            config.address = server.uri();
+            let client = Client::new(config).unwrap();
+            client.register().await.unwrap();
+            let runner = Runner::new(client);
+            let canceled = CancellationToken::new();
+            let heartbeat = runner.start_heartbeat("job-1", 7, canceled.clone());
+            if revoked {
+                time::timeout(Duration::from_secs(2), canceled.cancelled())
+                    .await
+                    .expect("definite lease revocation must cancel active execution");
+                heartbeat.await.unwrap();
+            } else {
+                // The first interval tick is immediate. Wait until the request
+                // has arrived, then ensure transient failures leave it active.
+                time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if server.received_requests().await.unwrap().len() >= 2 {
+                            break;
+                        }
+                        time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                time::sleep(Duration::from_millis(20)).await;
+                assert!(!canceled.is_cancelled());
+                assert!(!heartbeat.is_finished());
+                heartbeat.abort();
+                let _ = heartbeat.await;
+            }
             server.verify().await;
         }
     }

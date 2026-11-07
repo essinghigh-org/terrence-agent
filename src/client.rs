@@ -126,6 +126,32 @@ impl ArtifactUrl {
 pub struct JobStatus {
     #[serde(default)]
     pub canceled: bool,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+impl JobStatus {
+    /// Stop effects when the server explicitly reports that the claim is no
+    /// longer active. Older responses may only include the cancellation flag.
+    pub fn execution_revoked(&self) -> bool {
+        self.canceled
+            || matches!(
+                self.status.as_deref(),
+                Some("completed" | "errored" | "canceled" | "queued")
+            )
+    }
+}
+
+impl ClientError {
+    /// A definite loss of job authority must stop execution immediately;
+    /// transport failures, throttling and server errors remain retryable.
+    pub fn execution_revoked(&self) -> bool {
+        match self {
+            Self::Auth(_) => true,
+            Self::Http { status, .. } => matches!(status.as_u16(), 401 | 403 | 404 | 409),
+            _ => false,
+        }
+    }
 }
 
 fn native_tls(
@@ -1805,5 +1831,38 @@ mod tests {
                 Err(ClientError::InvalidPath { .. })
             ));
         }
+    }
+
+    #[test]
+    fn job_authority_distinguishes_revocation_from_transient_failure() {
+        for status in ["completed", "errored", "canceled", "queued"] {
+            let status: JobStatus = serde_json::from_value(json!({"status":status})).unwrap();
+            assert!(status.execution_revoked());
+        }
+        for body in [json!({}), json!({"status":"claimed"})] {
+            let status: JobStatus = serde_json::from_value(body).unwrap();
+            assert!(!status.execution_revoked());
+        }
+        let canceled: JobStatus = serde_json::from_value(json!({"canceled":true})).unwrap();
+        assert!(canceled.execution_revoked());
+        assert!(ClientError::Auth("revoked".to_owned()).execution_revoked());
+        for code in [401, 403, 404, 409, 429, 500, 502, 503] {
+            let error = ClientError::Http {
+                path: "/api/agent/jobs/job/status".to_owned(),
+                status: StatusCode::from_u16(code).unwrap(),
+                body: String::new(),
+            };
+            assert_eq!(
+                error.execution_revoked(),
+                matches!(code, 401 | 403 | 404 | 409)
+            );
+        }
+        assert!(
+            !ClientError::RetryAfter {
+                path: "/api/agent/jobs/job/status".to_owned(),
+                delay: Duration::from_secs(1),
+            }
+            .execution_revoked()
+        );
     }
 }
