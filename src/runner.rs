@@ -1055,8 +1055,11 @@ impl Runner {
                             )
                             .await
                         {
-                            apply_error =
-                                Some(format!("native apply evidence upload failed: {error}"));
+                            let upload = format!("native apply evidence upload failed: {error}");
+                            apply_error = Some(match apply_error.take() {
+                                Some(original) => format!("{original}; {upload}"),
+                                None => upload,
+                            });
                         }
                     }
                     if let Err(error) = persist_apply_marker(&marker, apply_error.as_deref()) {

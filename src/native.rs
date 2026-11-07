@@ -14,9 +14,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
+    ffi::CString,
     fs::{self, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -714,7 +718,7 @@ impl NativeSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let launcher = scope.0.join("launcher/cgroup.procs");
+        let launcher = CString::new(scope.0.join("launcher/cgroup.procs").as_os_str().as_bytes())?;
         let parent = std::process::id();
         unsafe {
             child_command.pre_exec(move || {
@@ -722,9 +726,41 @@ impl NativeSession {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::getppid() != parent as i32 {
-                    return Err(std::io::Error::other("native owner parent exited"));
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
                 }
-                fs::write(&launcher, format!("{}", libc::getpid()))?;
+                // No allocator or filesystem wrappers after a multi-threaded
+                // fork. Construct the PID with a stack buffer and libc only.
+                let mut buffer = [0u8; 20];
+                let mut number = libc::getpid() as u32;
+                let mut start = buffer.len();
+                loop {
+                    start -= 1;
+                    buffer[start] = b'0' + (number % 10) as u8;
+                    number /= 10;
+                    if number == 0 {
+                        break;
+                    }
+                }
+                let fd = libc::open(launcher.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let written =
+                    libc::write(fd, buffer[start..].as_ptr().cast(), buffer.len() - start);
+                let write_error = if written < 0 {
+                    Some(std::io::Error::last_os_error())
+                } else if written as usize != buffer.len() - start {
+                    Some(std::io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    None
+                };
+                let closed = libc::close(fd);
+                if let Some(error) = write_error {
+                    return Err(error);
+                }
+                if closed != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }

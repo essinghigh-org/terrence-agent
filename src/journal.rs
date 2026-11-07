@@ -106,12 +106,28 @@ impl Journal {
     pub fn start(&self, manifest: ExecutionManifest) -> Result<JournalEntry> {
         let path = self.path_for_job(&manifest.job_id);
         if path.exists() {
-            let existing = self.read(&path)?;
-            if existing.manifest.fingerprint != manifest.fingerprint {
+            let mut existing = self.read(&path)?;
+            let legacy = existing.manifest.fencing_token == 0
+                && !existing.manifest.native_policy
+                && !manifest.native_policy
+                && manifest.legacy_fingerprint.as_deref()
+                    == Some(existing.manifest.fingerprint.as_str());
+            if !legacy
+                && (existing.manifest.fingerprint != manifest.fingerprint
+                    || existing.manifest.fencing_token != manifest.fencing_token
+                    || existing.manifest.native_policy != manifest.native_policy)
+            {
                 bail!(
                     "job {} has a different execution fingerprint in the local journal",
                     manifest.job_id
                 );
+            }
+            // Only a claimed record is known to have had no side effects.
+            // Adopt its current lease before first execution; all later legacy
+            // states retain their original record and are never executed again.
+            if legacy && existing.state == JournalState::Claimed {
+                existing.manifest = manifest;
+                return self.update(&existing, JournalState::Claimed, None);
             }
             return Ok(existing);
         }
@@ -353,6 +369,7 @@ mod tests {
 
     fn manifest(root: &Path) -> ExecutionManifest {
         ExecutionManifest {
+            legacy_fingerprint: None,
             fencing_token: 1,
             native_policy: false,
             job_id: "job-1".to_owned(),
@@ -394,6 +411,51 @@ mod tests {
                 state_artifact: None,
             },
         }
+    }
+
+    #[test]
+    fn legacy_claim_adopts_its_first_fence_but_completed_work_is_only_deduplicated() {
+        let directory = tempdir().unwrap();
+        let journal = Journal::open(directory.path()).unwrap();
+        let mut old = manifest(directory.path());
+        old.fencing_token = 0;
+        old.fingerprint = "released-fingerprint".to_owned();
+        let claimed = journal.start(old.clone()).unwrap();
+        let mut current = old.clone();
+        current.fingerprint = "current-fenced-fingerprint".to_owned();
+        current.fencing_token = 7;
+        current.legacy_fingerprint = Some(old.fingerprint.clone());
+        let mut native = current.clone();
+        native.native_policy = true;
+        assert!(journal.start(native).is_err());
+        let adopted = journal.start(current.clone()).unwrap();
+        assert_eq!(adopted.state, JournalState::Claimed);
+        assert_eq!(adopted.manifest.fencing_token, 7);
+        let mut changed = current;
+        changed.fencing_token = 8;
+        assert!(journal.start(changed).is_err());
+        let reopened = Journal::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .read(&reopened.path_for_job(&old.job_id))
+                .unwrap()
+                .manifest
+                .fencing_token,
+            7
+        );
+
+        old.job_id = "legacy-completed".to_owned();
+        let started = journal.start(old.clone()).unwrap();
+        let pending = journal
+            .record_completion(&started, &completion(), None, false)
+            .unwrap();
+        let acked = journal.mark_completion_acked(&pending).unwrap();
+        journal.mark_cleanup_done(&acked).unwrap();
+        old.legacy_fingerprint = Some(old.fingerprint.clone());
+        old.fingerprint = "new-fingerprint".to_owned();
+        old.fencing_token = 7;
+        assert_eq!(journal.start(old).unwrap().state, JournalState::CleanupDone);
+        assert_eq!(claimed.state, JournalState::Claimed);
     }
 
     #[test]
