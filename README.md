@@ -91,6 +91,28 @@ Frozen policy sources, the private receipt key and owner captures stay outside t
 
 An apply failure can occur after resources change. The agent captures state into separate trusted storage and reports failure without claiming rollback. If completion or state publication fails, it retains the work directory and durable completion journal. An expired or canceled admitted native apply holds the server's workspace lock until state recovery is acknowledged. Stop the old execution and recover its retained state before using the existing operator recovery/force-unlock workflow; the agent does not automatically rerun that apply.
 
+After abrupt native-agent death, restart preserves the journal's `work_dir` and reports that recovery is required. Wait for the old native cgroup to be empty. Recover `terraform.tfstate` from that directory (beneath the configured workspace working directory, if any). The original owning agent may submit the retained raw JSON state through `PUT /api/agent/status`, authenticated with its agent token and `tfc-agent-id`, using the original fencing token:
+
+```json
+{
+  "status": "idle",
+  "job": {
+    "status": "errored",
+    "error": "Recovered state after agent process death; no rollback occurred",
+    "data": {
+      "run_id": "<original run ID>",
+      "operation": "apply",
+      "fencing_token": 1,
+      "state": "<raw Terraform state JSON as a JSON string>",
+      "state_recovered": true,
+      "state_recovery_required": false
+    }
+  }
+}
+```
+
+Use the actual journaled fencing token. Recovery preserves the run's errored status and releases the workspace lock only after state publication. Keep larger states and the local directory for the existing operator state-recovery workflow; ordinary inline capture is bounded to 8 MiB. This recovery completion was qualified with all 200 resources retained after an actual process kill. No interrupted apply is automatically requeued.
+
 ## Diagnostics
 
 The binary has local, offline-friendly checks for deployment support:

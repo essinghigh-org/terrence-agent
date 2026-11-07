@@ -684,7 +684,7 @@ impl NativeSession {
                 })
             })
             .collect::<Result<_>>()?;
-        let mut config = json!({"schemaVersion":1,"executionId":self.manifest.execution_id,"runtime":self.profile.runtime,"runId":self.manifest.run_id,"workspaceId":self.manifest.workspace_id,"evaluationId":self.manifest.evaluation_id,"policyFingerprint":self.manifest.policy_fingerprint,"receiptKey":self.manifest.receipt_key,"command":command,"workRoot":work_root,"workDirectory":cwd,"privateParent":self.profile.private_parent,"cgroupRoot":scope.0,"policyRoots":self.roots,"environment":self.environment(environment).into_iter().collect::<BTreeMap<_,_>>(),"arguments":args,"runContext":self.manifest.run_context,"timeoutSeconds":timeout.as_secs().max(1),"overrides":overrides});
+        let mut config = json!({"schemaVersion":1,"parentPid":std::process::id(),"executionId":self.manifest.execution_id,"runtime":self.profile.runtime,"runId":self.manifest.run_id,"workspaceId":self.manifest.workspace_id,"evaluationId":self.manifest.evaluation_id,"policyFingerprint":self.manifest.policy_fingerprint,"receiptKey":self.manifest.receipt_key,"command":command,"workRoot":work_root,"workDirectory":cwd,"privateParent":self.profile.private_parent,"cgroupRoot":scope.0,"policyRoots":self.roots,"environment":self.environment(environment).into_iter().collect::<BTreeMap<_,_>>(),"arguments":args,"runContext":self.manifest.run_context,"timeoutSeconds":timeout.as_secs().max(1),"overrides":overrides});
         if command == "apply" {
             let saved = self
                 .manifest

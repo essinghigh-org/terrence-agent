@@ -405,11 +405,16 @@ async fn finish_journal_entry(
         JournalState::CleanupDone => return Ok(()),
         JournalState::Claimed | JournalState::Executing => {
             // A process restart can leave only the execution marker behind.
-            // Terminalize that stale claim instead of retrying the job or
-            // blocking every subsequent poll forever.
+            // Never replay the stale claim. A native apply retains its local
+            // directory and remains unacknowledged until state is recovered.
+            let native_apply = entry.manifest.native_policy && entry.manifest.phase == "apply";
             let completion = CompletionJob {
                 status: "errored",
-                error: Some("agent restarted before durable completion".to_owned()),
+                error: Some(if native_apply {
+                    "Agent restarted during native apply; infrastructure may have changed. The local execution directory is retained for state recovery; no rollback occurred.".to_owned()
+                } else {
+                    "agent restarted before durable completion".to_owned()
+                }),
                 data: CompletionData {
                     fencing_token: Some(entry.manifest.fencing_token),
                     run_id: entry.manifest.run_id.clone(),
@@ -428,8 +433,7 @@ async fn finish_journal_entry(
                     provenance_digest: None,
                     log_incomplete: None,
                     state_recovered: false,
-                    state_recovery_required: entry.manifest.native_policy
-                        && entry.manifest.phase == "apply",
+                    state_recovery_required: native_apply,
                     apply_error: None,
                     state_recovery_error: None,
                     lifecycle: Some("agent_restarted".to_owned()),
@@ -442,7 +446,7 @@ async fn finish_journal_entry(
                 &entry,
                 &completion,
                 entry.manifest.work_dir.clone(),
-                false,
+                native_apply,
             )?;
             report_completion_details(
                 client,

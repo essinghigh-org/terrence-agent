@@ -26,6 +26,7 @@ use crate::config::{
     Config, ensure_private_dir, is_loader_variable, validate_environment_entry,
     validate_existing_private_file, validate_secure_executable,
 };
+use crate::journal::Journal;
 use crate::logs::{LogStream, LogWriter};
 use crate::manifest::ExecutionManifest;
 use crate::native::{NativeSession, PrivateDirectory};
@@ -238,8 +239,21 @@ impl Runner {
             match RunDirectory::create(&self.config.data_dir) {
                 Ok(run_directory) => {
                     let work_dir = run_directory.path().to_owned();
+                    let recorded = if payload.data.native_policy_url.is_some() {
+                        Journal::open(&self.config.data_dir).and_then(|journal| {
+                            journal.bind_work_dir(
+                                &ExecutionManifest::from_payload(payload)?,
+                                &work_dir,
+                            )
+                        })
+                    } else {
+                        Ok(())
+                    };
                     (
-                        self.run_inner(payload, &work_dir, control).await,
+                        match recorded {
+                            Ok(()) => self.run_inner(payload, &work_dir, control).await,
+                            Err(error) => Err(error),
+                        },
                         Some(work_dir),
                     )
                 }

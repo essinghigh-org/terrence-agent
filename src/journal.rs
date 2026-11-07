@@ -129,6 +129,25 @@ impl Journal {
         self.update(entry, JournalState::Executing, None)
     }
 
+    /// Bind the opaque directory durably before a native command can mutate
+    /// infrastructure. A crash must not lose the only path to its state.
+    pub fn bind_work_dir(&self, manifest: &ExecutionManifest, directory: &Path) -> Result<()> {
+        let mut entry = self.read(&self.path_for_job(&manifest.job_id))?;
+        if entry.state != JournalState::Executing
+            || entry.manifest.fingerprint != manifest.fingerprint
+            || entry
+                .manifest
+                .work_dir
+                .as_deref()
+                .is_some_and(|path| path != directory)
+        {
+            bail!("native execution directory does not match its durable claim");
+        }
+        entry.manifest.work_dir = Some(directory.to_owned());
+        self.update(&entry, JournalState::Executing, None)?;
+        Ok(())
+    }
+
     pub fn record_completion(
         &self,
         entry: &JournalEntry,
@@ -375,6 +394,29 @@ mod tests {
                 state_artifact: None,
             },
         }
+    }
+
+    #[test]
+    fn native_directory_survives_restart_and_cannot_be_rebound() {
+        let directory = tempdir().unwrap();
+        let journal = Journal::open(directory.path()).unwrap();
+        let mut intended = manifest(directory.path());
+        intended.work_dir = None;
+        let claimed = journal.start(intended.clone()).unwrap();
+        let path = directory.path().join("runs/native-directory");
+        assert!(journal.bind_work_dir(&claimed.manifest, &path).is_err());
+        let executing = journal.mark_executing(&claimed).unwrap();
+        journal.bind_work_dir(&executing.manifest, &path).unwrap();
+        let reopened = Journal::open(directory.path()).unwrap();
+        let loaded = reopened.unfinished().unwrap().remove(0);
+        assert_eq!(loaded.manifest.work_dir.as_deref(), Some(path.as_path()));
+        assert!(
+            reopened
+                .bind_work_dir(&intended, &directory.path().join("another-directory"))
+                .is_err()
+        );
+        intended.fingerprint = "a-different-claim".to_owned();
+        assert!(reopened.bind_work_dir(&intended, &path).is_err());
     }
 
     #[test]
