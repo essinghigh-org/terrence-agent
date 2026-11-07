@@ -764,7 +764,12 @@ impl NativeSession {
                 Ok(())
             });
         }
-        let mut child = child_command.spawn()?;
+        let mut child = child_command.spawn().with_context(|| {
+            format!(
+                "spawn native owner for {command}: join cgroup launcher {}",
+                scope.0.join("launcher/cgroup.procs").display()
+            )
+        })?;
         let stdout = child.stdout.take().context("native owner stdout")?;
         let stderr = child.stderr.take().context("native owner stderr")?;
         let out = tokio::spawn(read_control(stdout));
