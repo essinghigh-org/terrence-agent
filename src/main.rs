@@ -379,6 +379,46 @@ async fn report_completion_details(
     }
 }
 
+/// Acknowledge only accepted completions. An explicit stale-lease response is
+/// terminal locally, preserving all original recovery data without retrying it.
+async fn acknowledge_journal_completion(
+    client: &Client,
+    journal: &Journal,
+    entry: &JournalEntry,
+    metrics: &Metrics,
+) -> Result<JournalEntry> {
+    let completion = entry
+        .completion()
+        .cloned()
+        .context("completion-pending journal entry has no completion")?;
+    match report_completion_details(
+        client,
+        &entry.manifest.phase,
+        &entry.manifest.run_id,
+        completion,
+        metrics,
+    )
+    .await
+    {
+        Ok(()) => journal.mark_completion_acked(entry),
+        Err(error)
+            if error
+                .downcast_ref::<ClientError>()
+                .is_some_and(ClientError::stale_completion_lease) =>
+        {
+            let retained = journal.quarantine_stale_completion(entry)?;
+            error!(
+                job_id = %retained.manifest.job_id,
+                run_id = %retained.manifest.run_id,
+                work_dir = ?retained.manifest.work_dir,
+                "stale completion lease requires operator reconciliation; original completion and state retained without replay or acknowledgement"
+            );
+            Ok(retained)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn finish_journal_entry(
     client: &Client,
     runner: &Runner,
@@ -408,19 +448,7 @@ async fn finish_journal_entry(
     }
     let entry = match entry.state {
         JournalState::CompletionPending => {
-            let completion = entry
-                .completion()
-                .cloned()
-                .context("completion-pending journal entry has no completion")?;
-            report_completion_details(
-                client,
-                &entry.manifest.phase,
-                &entry.manifest.run_id,
-                completion,
-                metrics,
-            )
-            .await?;
-            journal.mark_completion_acked(&entry)?
+            acknowledge_journal_completion(client, journal, &entry, metrics).await?
         }
         JournalState::CompletionAcked => entry,
         JournalState::CleanupDone | JournalState::RecoveryRequired => return Ok(()),
@@ -469,17 +497,12 @@ async fn finish_journal_entry(
                 entry.manifest.work_dir.clone(),
                 native_apply,
             )?;
-            report_completion_details(
-                client,
-                &entry.manifest.phase,
-                &entry.manifest.run_id,
-                completion,
-                metrics,
-            )
-            .await?;
-            journal.mark_completion_acked(&pending)?
+            acknowledge_journal_completion(client, journal, &pending, metrics).await?
         }
     };
+    if entry.state == JournalState::RecoveryRequired {
+        return Ok(());
+    }
     if entry.retain_work_dir {
         warn!(
             job_id = %entry.manifest.job_id,

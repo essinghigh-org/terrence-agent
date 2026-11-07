@@ -2641,6 +2641,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_completion_is_retained_without_blocking_claims_and_other_errors_retry() {
+        use crate::journal::JournalState;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for already_pending in [false, true] {
+            for (code, body, stale) in [
+                (409, json!({"errors":[{"code":"stale-agent-lease"}]}), true),
+                (409, json!({"errors":[{"code":"other-conflict"}]}), false),
+                (503, json!({"errors":[{"code":"stale-agent-lease"}]}), false),
+                (429, json!({"error":"throttled"}), false),
+                (401, json!({"error":"unauthorized"}), false),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/api/agent/register"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "id":"agent-1", "agent_pool_id":"pool-1"
+                    })))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path("/api/agent/status"))
+                    .respond_with(ResponseTemplate::new(code).set_body_json(body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let temp = tempdir().unwrap();
+                let mut config = test_runner(temp.path().to_owned()).config.clone();
+                config.address = server.uri();
+                let client = Client::new(config.clone()).unwrap();
+                client.register().await.unwrap();
+                let runner = Runner::new(client.clone());
+                let journal = Journal::open(temp.path()).unwrap();
+                let directory = RunDirectory::create(temp.path()).unwrap();
+                let state_path = directory.path().join("terraform.tfstate");
+                fs::write(&state_path, b"retained-state").unwrap();
+                let mut manifest =
+                    ExecutionManifest::from_payload(&test_payload("job-1", "run-1")).unwrap();
+                manifest.fencing_token = 7;
+                manifest.native_policy = true;
+                manifest.phase = "apply".to_owned();
+                manifest.work_dir = Some(directory.path().to_owned());
+                let claimed = journal.start(manifest.clone()).unwrap();
+                let mut entry = journal.mark_executing(&claimed).unwrap();
+                if already_pending {
+                    let completion = CompletionJob {
+                        status: "errored",
+                        error: Some("original apply failure".to_owned()),
+                        data: serde_json::from_value(json!({
+                            "fencing_token":7,"run_id":"run-1","operation":"apply",
+                            "has_changes":false,"generated_configuration":false,
+                            "action_failures":1,"action_invocations":1,"state":"{\"version\":4}"
+                        }))
+                        .unwrap(),
+                    };
+                    entry = journal
+                        .record_completion(&entry, &completion, manifest.work_dir.clone(), false)
+                        .unwrap();
+                }
+                let result = crate::finish_journal_entry(
+                    &client,
+                    &runner,
+                    &journal,
+                    entry,
+                    &Metrics::new(),
+                    false,
+                )
+                .await;
+                assert_eq!(result.is_ok(), stale);
+                let reopened = Journal::open(temp.path()).unwrap();
+                let retained = reopened.start(manifest.clone()).unwrap();
+                assert_eq!(retained.manifest.fencing_token, 7);
+                assert_eq!(retained.manifest.work_dir, manifest.work_dir);
+                assert_eq!(retained.completion().unwrap().data.fencing_token, Some(7));
+                if already_pending {
+                    assert_eq!(
+                        retained.completion().unwrap().error.as_deref(),
+                        Some("original apply failure")
+                    );
+                    assert_eq!(
+                        retained.completion().unwrap().data.state.as_deref(),
+                        Some("{\"version\":4}")
+                    );
+                }
+                assert_eq!(fs::read(&state_path).unwrap(), b"retained-state");
+                if stale {
+                    assert_eq!(retained.state, JournalState::RecoveryRequired);
+                    assert!(retained.retain_work_dir);
+                    assert!(reopened.unfinished().unwrap().is_empty());
+                    Mock::given(method("GET"))
+                        .and(path("/api/agent/jobs"))
+                        .respond_with(ResponseTemplate::new(204))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    assert_eq!(
+                        crate::poll_once(
+                            &client,
+                            &runner,
+                            &reopened,
+                            &config,
+                            &Metrics::new(),
+                            &CancellationToken::new()
+                        )
+                        .await
+                        .unwrap(),
+                        crate::PollResult::Idle
+                    );
+                } else {
+                    assert_eq!(retained.state, JournalState::CompletionPending);
+                    assert_eq!(reopened.unfinished().unwrap().len(), 1);
+                    server.verify().await;
+                    server.reset().await;
+                    Mock::given(method("PUT"))
+                        .and(path("/api/agent/status"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    crate::finish_journal_entry(
+                        &client,
+                        &runner,
+                        &reopened,
+                        retained,
+                        &Metrics::new(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        reopened.start(manifest).unwrap().state,
+                        JournalState::CleanupDone
+                    );
+                }
+                server.verify().await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn heartbeat_cancels_revoked_claims_but_keeps_transient_errors_retryable() {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -124,6 +124,11 @@ state with the server before manually recovering or unlocking its workspace.
 Fresh non-native completions against older servers still use their original
 unfenced contract; only automatic replay is quarantined.
 
+An explicit `stale-agent-lease` completion rejection is also quarantined with
+its original fencing token, completion and work directory retained. It cannot
+block unrelated jobs or be treated as a successful acknowledgement. Transport
+errors, throttling, server failures and other conflicts remain pending for retry.
+
 ## Diagnostics
 
 The binary has local, offline-friendly checks for deployment support:

@@ -143,6 +143,27 @@ impl JobStatus {
 }
 
 impl ClientError {
+    /// Only the server's explicit stale-lease code is a terminal completion
+    /// rejection. Other conflicts, authentication errors and outages may retry.
+    pub fn stale_completion_lease(&self) -> bool {
+        let Self::Http { status, body, .. } = self else {
+            return false;
+        };
+        *status == StatusCode::CONFLICT
+            && serde_json::from_str::<Value>(body)
+                .ok()
+                .is_some_and(|body| {
+                    body.get("errors")
+                        .and_then(Value::as_array)
+                        .is_some_and(|errors| {
+                            errors.iter().any(|error| {
+                                error.get("code").and_then(Value::as_str)
+                                    == Some("stale-agent-lease")
+                            })
+                        })
+                })
+    }
+
     /// A definite loss of job authority must stop execution immediately;
     /// transport failures, throttling and server errors remain retryable.
     pub fn execution_revoked(&self) -> bool {
@@ -1831,6 +1852,26 @@ mod tests {
                 Err(ClientError::InvalidPath { .. })
             ));
         }
+    }
+
+    #[test]
+    fn stale_completion_requires_the_explicit_server_code() {
+        for body in [
+            "",
+            "not JSON",
+            "{}",
+            "{\"errors\":[{\"detail\":\"stale-agent-lease\"}]}",
+        ] {
+            assert!(
+                !ClientError::Http {
+                    path: "/api/agent/status".to_owned(),
+                    status: StatusCode::CONFLICT,
+                    body: body.to_owned(),
+                }
+                .stale_completion_lease()
+            );
+        }
+        assert!(!ClientError::Auth("expired token".to_owned()).stale_completion_lease());
     }
 
     #[test]

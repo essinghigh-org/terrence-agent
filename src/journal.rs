@@ -215,6 +215,19 @@ impl Journal {
         if !entry.needs_unfenced_recovery() {
             bail!("only unfenced execution records may be quarantined");
         }
+        self.retain_for_recovery(entry)
+    }
+
+    /// Preserve a completion explicitly rejected by the server as stale. It
+    /// must not be acknowledged, cleaned up or replayed under a different lease.
+    pub fn quarantine_stale_completion(&self, entry: &JournalEntry) -> Result<JournalEntry> {
+        if entry.state != JournalState::CompletionPending || entry.completion.is_none() {
+            bail!("only pending completions may be quarantined after lease rejection");
+        }
+        self.retain_for_recovery(entry)
+    }
+
+    fn retain_for_recovery(&self, entry: &JournalEntry) -> Result<JournalEntry> {
         let mut retained = entry.clone();
         retained.retain_work_dir = true;
         self.update(
