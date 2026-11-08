@@ -27,6 +27,9 @@ pub enum JournalState {
     CompletionPending,
     CompletionAcked,
     CleanupDone,
+    /// Side effects lack a replayable lease identity. Preserve the completion
+    /// and local artifacts for operator reconciliation without retrying them.
+    RecoveryRequired,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -86,6 +89,21 @@ impl JournalEntry {
     pub fn completion(&self) -> Option<&CompletionJob> {
         self.completion.as_ref()
     }
+
+    /// Unfenced effects must never be relabeled with a newer claim's fence.
+    /// A status endpoint may reject or ignore them, neither of which is an ACK.
+    pub fn needs_unfenced_recovery(&self) -> bool {
+        match self.state {
+            JournalState::Executing => self.manifest.fencing_token == 0,
+            JournalState::CompletionPending => {
+                self.manifest.fencing_token == 0
+                    || self.completion.as_ref().is_some_and(|completion| {
+                        completion.data.fencing_token != Some(self.manifest.fencing_token)
+                    })
+            }
+            _ => false,
+        }
+    }
 }
 
 pub struct Journal {
@@ -106,12 +124,28 @@ impl Journal {
     pub fn start(&self, manifest: ExecutionManifest) -> Result<JournalEntry> {
         let path = self.path_for_job(&manifest.job_id);
         if path.exists() {
-            let existing = self.read(&path)?;
-            if existing.manifest.fingerprint != manifest.fingerprint {
+            let mut existing = self.read(&path)?;
+            let legacy = existing.manifest.fencing_token == 0
+                && !existing.manifest.native_policy
+                && !manifest.native_policy
+                && manifest.legacy_fingerprint.as_deref()
+                    == Some(existing.manifest.fingerprint.as_str());
+            if !legacy
+                && (existing.manifest.fingerprint != manifest.fingerprint
+                    || existing.manifest.fencing_token != manifest.fencing_token
+                    || existing.manifest.native_policy != manifest.native_policy)
+            {
                 bail!(
                     "job {} has a different execution fingerprint in the local journal",
                     manifest.job_id
                 );
+            }
+            // Only a claimed record is known to have had no side effects.
+            // Adopt its current lease before first execution; all later legacy
+            // states retain their original record and are never executed again.
+            if legacy && existing.state == JournalState::Claimed {
+                existing.manifest = manifest;
+                return self.update(&existing, JournalState::Claimed, None);
             }
             return Ok(existing);
         }
@@ -127,6 +161,25 @@ impl Journal {
 
     pub fn mark_executing(&self, entry: &JournalEntry) -> Result<JournalEntry> {
         self.update(entry, JournalState::Executing, None)
+    }
+
+    /// Bind the opaque directory durably before a native command can mutate
+    /// infrastructure. A crash must not lose the only path to its state.
+    pub fn bind_work_dir(&self, manifest: &ExecutionManifest, directory: &Path) -> Result<()> {
+        let mut entry = self.read(&self.path_for_job(&manifest.job_id))?;
+        if entry.state != JournalState::Executing
+            || entry.manifest.fingerprint != manifest.fingerprint
+            || entry
+                .manifest
+                .work_dir
+                .as_deref()
+                .is_some_and(|path| path != directory)
+        {
+            bail!("native execution directory does not match its durable claim");
+        }
+        entry.manifest.work_dir = Some(directory.to_owned());
+        self.update(&entry, JournalState::Executing, None)?;
+        Ok(())
     }
 
     pub fn record_completion(
@@ -154,6 +207,37 @@ impl Journal {
         // Once the server has acknowledged the completion, no retry payload
         // is needed; keep only the manifest until the run directory is gone.
         self.update(entry, JournalState::CompletionAcked, None)
+    }
+
+    /// Stop automatic replay while preserving the original completion and
+    /// workspace. This is deliberately not a control-plane acknowledgement.
+    pub fn quarantine_unfenced(&self, entry: &JournalEntry) -> Result<JournalEntry> {
+        if !entry.needs_unfenced_recovery() {
+            bail!("only unfenced execution records may be quarantined");
+        }
+        self.retain_for_recovery(entry)
+    }
+
+    /// Preserve a completion explicitly rejected by the server as stale. It
+    /// must not be acknowledged, cleaned up or replayed under a different lease.
+    pub fn quarantine_stale_completion(&self, entry: &JournalEntry) -> Result<JournalEntry> {
+        if entry.state != JournalState::CompletionPending || entry.completion.is_none() {
+            bail!("only pending completions may be quarantined after lease rejection");
+        }
+        self.retain_for_recovery(entry)
+    }
+
+    fn retain_for_recovery(&self, entry: &JournalEntry) -> Result<JournalEntry> {
+        let mut retained = entry.clone();
+        retained.retain_work_dir = true;
+        self.update(
+            &retained,
+            JournalState::RecoveryRequired,
+            entry
+                .completion
+                .as_ref()
+                .map(StoredCompletion::from_completion),
+        )
     }
 
     pub fn mark_cleanup_done(&self, entry: &JournalEntry) -> Result<JournalEntry> {
@@ -185,7 +269,9 @@ impl Journal {
             .filter(|entry| {
                 if matches!(
                     entry.state,
-                    JournalState::Claimed | JournalState::CleanupDone
+                    JournalState::Claimed
+                        | JournalState::CleanupDone
+                        | JournalState::RecoveryRequired
                 ) {
                     return false;
                 }
@@ -334,6 +420,9 @@ mod tests {
 
     fn manifest(root: &Path) -> ExecutionManifest {
         ExecutionManifest {
+            legacy_fingerprint: None,
+            fencing_token: 1,
+            native_policy: false,
             job_id: "job-1".to_owned(),
             run_id: "run-1".to_owned(),
             phase: "apply".to_owned(),
@@ -347,6 +436,7 @@ mod tests {
             status: "finished",
             error: None,
             data: CompletionData {
+                fencing_token: None,
                 run_id: "run-1".to_owned(),
                 operation: "apply".to_owned(),
                 has_changes: true,
@@ -372,6 +462,181 @@ mod tests {
                 state_artifact: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn unfenced_effects_are_retained_without_replay_cleanup_or_reexecution() {
+        for pending in [false, true] {
+            let directory = tempdir().unwrap();
+            let journal = Journal::open(directory.path()).unwrap();
+            let mut old = manifest(directory.path());
+            old.fencing_token = 0;
+            old.fingerprint = "released-fingerprint".to_owned();
+            let work_dir = old.work_dir.as_ref().unwrap();
+            fs::create_dir_all(work_dir).unwrap();
+            fs::write(work_dir.join("terraform.tfstate"), "retained-state").unwrap();
+            let claimed = journal.start(old.clone()).unwrap();
+            let mut entry = journal.mark_executing(&claimed).unwrap();
+            if pending {
+                entry = journal
+                    .record_completion(&entry, &completion(), old.work_dir.clone(), false)
+                    .unwrap();
+            }
+            // A nonregistered client cannot acknowledge completion. Recovery
+            // must return without any network submission or directory cleanup.
+            let client = crate::client::Client::new(crate::config::Config {
+                address: "https://example.test".to_owned(),
+                token: crate::config::SecretString::new("test-token").unwrap(),
+                token_file: None,
+                display_name: "test".to_owned(),
+                hostname: "test".to_owned(),
+                instance_id: "11111111-1111-4111-8111-111111111111".to_owned(),
+                session_id: "22222222-2222-4222-8222-222222222222".to_owned(),
+                data_dir: directory.path().to_owned(),
+                cache_dir: directory.path().join("cache"),
+                single: false,
+                sandbox: false,
+                check_interval: Duration::from_secs(1),
+                log_level: "info".to_owned(),
+                log_json: false,
+                accept: "plan,apply".to_owned(),
+                max_parallelism: 64,
+                terraform_path: None,
+                tofu_path: None,
+                landlock_runner: None,
+            })
+            .unwrap();
+            let runner = crate::runner::Runner::new(client.clone());
+            crate::finish_journal_entry(
+                &client,
+                &runner,
+                &journal,
+                entry,
+                &crate::observability::Metrics::new(),
+                false,
+            )
+            .await
+            .unwrap();
+            let reopened = Journal::open(directory.path()).unwrap();
+            assert!(reopened.unfinished().unwrap().is_empty());
+            let mut redelivery = old.clone();
+            redelivery.fencing_token = 7;
+            redelivery.legacy_fingerprint = Some(old.fingerprint.clone());
+            redelivery.fingerprint = "current-fingerprint".to_owned();
+            let retained = reopened.start(redelivery).unwrap();
+            assert_eq!(retained.state, JournalState::RecoveryRequired);
+            assert_eq!(retained.manifest.fencing_token, 0);
+            assert!(retained.retain_work_dir);
+            assert_eq!(retained.manifest.work_dir, old.work_dir);
+            assert_eq!(retained.completion().is_some(), pending);
+            if pending {
+                assert_eq!(
+                    retained.completion().unwrap().data.state.as_deref(),
+                    Some("{}")
+                );
+                assert_eq!(retained.completion().unwrap().data.fencing_token, None);
+            }
+            assert_eq!(
+                fs::read_to_string(work_dir.join("terraform.tfstate")).unwrap(),
+                "retained-state"
+            );
+            // Quarantine is terminal for this job, not for unrelated claims.
+            let mut unrelated = manifest(directory.path());
+            unrelated.job_id = "another-job".to_owned();
+            assert_eq!(
+                reopened.start(unrelated).unwrap().state,
+                JournalState::Claimed
+            );
+        }
+    }
+
+    #[test]
+    fn fenced_completion_is_replayable_only_with_its_original_lease() {
+        let directory = tempdir().unwrap();
+        let journal = Journal::open(directory.path()).unwrap();
+        let claimed = journal.start(manifest(directory.path())).unwrap();
+        let executing = journal.mark_executing(&claimed).unwrap();
+        assert!(!executing.needs_unfenced_recovery());
+        assert!(journal.quarantine_unfenced(&executing).is_err());
+        let mut finished = completion();
+        finished.data.fencing_token = Some(1);
+        let pending = journal
+            .record_completion(&executing, &finished, None, false)
+            .unwrap();
+        assert!(!pending.needs_unfenced_recovery());
+        finished.data.fencing_token = Some(2);
+        let mismatched = journal
+            .record_completion(&executing, &finished, None, false)
+            .unwrap();
+        assert!(mismatched.needs_unfenced_recovery());
+    }
+
+    #[test]
+    fn legacy_claim_adopts_its_first_fence_but_completed_work_is_only_deduplicated() {
+        let directory = tempdir().unwrap();
+        let journal = Journal::open(directory.path()).unwrap();
+        let mut old = manifest(directory.path());
+        old.fencing_token = 0;
+        old.fingerprint = "released-fingerprint".to_owned();
+        let claimed = journal.start(old.clone()).unwrap();
+        let mut current = old.clone();
+        current.fingerprint = "current-fenced-fingerprint".to_owned();
+        current.fencing_token = 7;
+        current.legacy_fingerprint = Some(old.fingerprint.clone());
+        let mut native = current.clone();
+        native.native_policy = true;
+        assert!(journal.start(native).is_err());
+        let adopted = journal.start(current.clone()).unwrap();
+        assert_eq!(adopted.state, JournalState::Claimed);
+        assert_eq!(adopted.manifest.fencing_token, 7);
+        let mut changed = current;
+        changed.fencing_token = 8;
+        assert!(journal.start(changed).is_err());
+        let reopened = Journal::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .read(&reopened.path_for_job(&old.job_id))
+                .unwrap()
+                .manifest
+                .fencing_token,
+            7
+        );
+
+        old.job_id = "legacy-completed".to_owned();
+        let started = journal.start(old.clone()).unwrap();
+        let pending = journal
+            .record_completion(&started, &completion(), None, false)
+            .unwrap();
+        let acked = journal.mark_completion_acked(&pending).unwrap();
+        journal.mark_cleanup_done(&acked).unwrap();
+        old.legacy_fingerprint = Some(old.fingerprint.clone());
+        old.fingerprint = "new-fingerprint".to_owned();
+        old.fencing_token = 7;
+        assert_eq!(journal.start(old).unwrap().state, JournalState::CleanupDone);
+        assert_eq!(claimed.state, JournalState::Claimed);
+    }
+
+    #[test]
+    fn native_directory_survives_restart_and_cannot_be_rebound() {
+        let directory = tempdir().unwrap();
+        let journal = Journal::open(directory.path()).unwrap();
+        let mut intended = manifest(directory.path());
+        intended.work_dir = None;
+        let claimed = journal.start(intended.clone()).unwrap();
+        let path = directory.path().join("runs/native-directory");
+        assert!(journal.bind_work_dir(&claimed.manifest, &path).is_err());
+        let executing = journal.mark_executing(&claimed).unwrap();
+        journal.bind_work_dir(&executing.manifest, &path).unwrap();
+        let reopened = Journal::open(directory.path()).unwrap();
+        let loaded = reopened.unfinished().unwrap().remove(0);
+        assert_eq!(loaded.manifest.work_dir.as_deref(), Some(path.as_path()));
+        assert!(
+            reopened
+                .bind_work_dir(&intended, &directory.path().join("another-directory"))
+                .is_err()
+        );
+        intended.fingerprint = "a-different-claim".to_owned();
+        assert!(reopened.bind_work_dir(&intended, &path).is_err());
     }
 
     #[test]

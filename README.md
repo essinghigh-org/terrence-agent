@@ -45,6 +45,7 @@ for an unsupported IaC binary.
 | `TERRENCE_AGENT_CACHE_DIR` | `<data_dir>/cache` | IaC binary cache (separate from run data) |
 | `TERRENCE_AGENT_SINGLE` | `false` | Claim one job and exit |
 | `TERRENCE_AGENT_SANDBOX` | `true` | Require Landlock for IaC commands |
+| `TERRENCE_AGENT_NATIVE_POLICY_PROFILE` | unset | Canonical read-only profile for opt-in native tfpolicy execution |
 | `TERRENCE_AGENT_SANDBOX_PROFILE` | `compatibility` | `strict`, `provisioner`, or compatibility profile |
 | `TERRENCE_AGENT_CHECK_INTERVAL_MS` | `2000` | Empty-pool polling floor |
 | `TERRENCE_AGENT_LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, or `error` |
@@ -79,6 +80,54 @@ Landlock ABI 1 and keeps common provider paths readable. Set
 
 The local `/doctor` endpoint is a non-failing health snapshot; use the
 `terrence-agent doctor` CLI command for the full diagnostic checks.
+
+## Native policy
+
+Native tfpolicy execution requires the matching Terrence server update and an operator-supplied licensed plugin. Follow the server's [native runtime setup](https://github.com/essinghigh-org/terrence/blob/491d069af40b4d8333abfd361e28d01f3cfd0e84/tools/tfpolicy-engine/HANDOFF.md), then set `TERRENCE_AGENT_NATIVE_POLICY_PROFILE` to that JSON profile shape on the agent host. Keep `TERRENCE_AGENT_SANDBOX=true`. Linux Landlock ABI 6, zero capabilities, disabled core dumps and an already delegated cgroup with finite PID/memory limits are required. The shipped service/container examples do not establish cgroup delegation automatically.
+
+The owner and runtime bytes must match the server's pins; paths may differ. Native jobs use the pinned strict Terraform 1.17.1 engine. `runtime.runner` is the native helper built by the server repository; `TERRENCE_LANDLOCK_RUNNER` remains this repository's helper for state capture. Registration checks both paths before offering `operation.native-policy.v2`. An invalid configured profile stops registration. With no profile, the agent keeps the legacy capability contract.
+
+Frozen policy sources, the private receipt key and owner captures stay outside the IaC directory and filesystem snapshot. The server authenticates the current job/lease, runtime, source, saved plan and plan JSON before accepting native completion. A public CA bundle may be pinned as `runtime.entitlementCA`; it is also used for the agent's HTTPS requests, with certificate validation enabled.
+
+An apply failure can occur after resources change. The agent captures state into separate trusted storage and reports failure without claiming rollback. If completion or state publication fails, it retains the work directory and durable completion journal. An expired or canceled admitted native apply holds the server's workspace lock until state recovery is acknowledged. Stop the old execution and recover its retained state before using the existing operator recovery/force-unlock workflow; the agent does not automatically rerun that apply.
+
+After abrupt native-agent death, restart preserves the journal's `work_dir` and reports that recovery is required. Wait for the old native cgroup to be empty. Recover `terraform.tfstate` from that directory (beneath the configured workspace working directory, if any). The original owning agent may submit the retained raw JSON state through `PUT /api/agent/status`, authenticated with its agent token and `tfc-agent-id`, using the original fencing token:
+
+```json
+{
+  "status": "idle",
+  "job": {
+    "status": "errored",
+    "error": "Recovered state after agent process death; no rollback occurred",
+    "data": {
+      "run_id": "<original run ID>",
+      "operation": "apply",
+      "fencing_token": 1,
+      "state": "<raw Terraform state JSON as a JSON string>",
+      "state_recovered": true,
+      "state_recovery_required": false
+    }
+  }
+}
+```
+
+Use the actual journaled fencing token. Recovery preserves the run's errored status and releases the workspace lock only after state publication. Keep larger states and the local directory for the existing operator state-recovery workflow; ordinary inline capture is bounded to 8 MiB. This recovery completion was qualified with all 200 resources retained after an actual process kill. No interrupted apply is automatically requeued.
+
+A replayed legacy journal entry that already started execution but lacks a
+matching fencing token is quarantined locally as `recovery_required`. This also
+applies after a failed live completion delivery, even without a restart. Its
+original completion and work directory are retained for operator reconciliation;
+the agent neither submits them under a newer lease nor treats an ignored status
+update as an acknowledgement. It can continue polling other jobs, but redelivery
+of the quarantined job never executes it again. Reconcile the original run and
+state with the server before manually recovering or unlocking its workspace.
+Fresh non-native completions against older servers still use their original
+unfenced contract; only automatic replay is quarantined.
+
+An explicit `stale-agent-lease` completion rejection is also quarantined with
+its original fencing token, completion and work directory retained. It cannot
+block unrelated jobs or be treated as a successful acknowledgement. Transport
+errors, throttling, server failures and other conflicts remain pending for retry.
 
 ## Diagnostics
 

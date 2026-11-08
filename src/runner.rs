@@ -26,8 +26,10 @@ use crate::config::{
     Config, ensure_private_dir, is_loader_variable, validate_environment_entry,
     validate_existing_private_file, validate_secure_executable,
 };
+use crate::journal::Journal;
 use crate::logs::{LogStream, LogWriter};
 use crate::manifest::ExecutionManifest;
+use crate::native::{NativeSession, PrivateDirectory};
 use crate::observability::Metrics;
 use crate::protocol::{
     AgentJobPayload, CompletionData, CompletionJob, JobContainer, JobData, Phase, PlanCounts,
@@ -237,8 +239,21 @@ impl Runner {
             match RunDirectory::create(&self.config.data_dir) {
                 Ok(run_directory) => {
                     let work_dir = run_directory.path().to_owned();
+                    let recorded = if payload.data.native_policy_url.is_some() {
+                        Journal::open(&self.config.data_dir).and_then(|journal| {
+                            journal.bind_work_dir(
+                                &ExecutionManifest::from_payload(payload)?,
+                                &work_dir,
+                            )
+                        })
+                    } else {
+                        Ok(())
+                    };
                     (
-                        self.run_inner(payload, &work_dir, control).await,
+                        match recorded {
+                            Ok(()) => self.run_inner(payload, &work_dir, control).await,
+                            Err(error) => Err(error),
+                        },
                         Some(work_dir),
                     )
                 }
@@ -263,9 +278,10 @@ impl Runner {
                     warn!(phase = payload.phase.as_str(), run_id = %payload.data.run_id, reason = %message, "job canceled");
                     return JobOutcome {
                         completion: CompletionJob {
-                            status: "canceled",
+                            status: "errored",
                             error: Some(message),
                             data: CompletionData {
+                                fencing_token: Some(payload.data.fencing_token),
                                 run_id: payload.data.run_id.clone(),
                                 operation: payload.phase.as_str().to_owned(),
                                 has_changes: false,
@@ -302,6 +318,7 @@ impl Runner {
                         status: "errored",
                         error: Some(message),
                         data: CompletionData {
+                            fencing_token: Some(payload.data.fencing_token),
                             run_id: payload.data.run_id.clone(),
                             operation: payload.phase.as_str().to_owned(),
                             has_changes: false,
@@ -366,6 +383,13 @@ impl Runner {
         // Completion/log delivery remains outside this TTL.
         let deadline = JobDeadline::parse(&payload.data.timeout)?;
         let container = payload.container()?;
+        let mut native = self
+            .await_deadline(
+                deadline,
+                "prepare native policy runtime",
+                NativeSession::prepare(&self.config, &self.client, payload),
+            )
+            .await?;
         ensure_private_dir(work_dir, "run directory")?;
         ensure_private_dir(&work_dir.join("tmp"), "run temporary directory")?;
 
@@ -406,6 +430,9 @@ impl Runner {
             )
             .await;
         fs::create_dir_all(&exec_dir)?;
+        if let Some(session) = native.as_ref() {
+            session.install_state(&exec_dir)?;
+        }
 
         let binary_name = match payload.data.iac_binary.as_deref().unwrap_or("terraform") {
             "terraform" => "terraform",
@@ -413,9 +440,12 @@ impl Runner {
             value => bail!("unsupported IaC binary requested by Terrence: {value}"),
         };
         let environment = execution_environment(payload, container, work_dir, self.config.sandbox)?;
-        let binary = self
-            .resolve_binary(binary_name, &payload.data, container, deadline)
-            .await?;
+        let binary = if let Some(session) = native.as_ref() {
+            session.engine().to_owned()
+        } else {
+            self.resolve_binary(binary_name, &payload.data, container, deadline)
+                .await?
+        };
         self.metrics
             .stage_event("tool.resolve", &payload.data.run_id, payload.phase.as_str())
             .await;
@@ -436,7 +466,11 @@ impl Runner {
                 .join("log-spool")
                 .join(&payload.data.run_id),
         );
-        let heartbeat = self.start_heartbeat(&payload.job_id, control.remote.clone());
+        let heartbeat = self.start_heartbeat(
+            &payload.job_id,
+            payload.data.fencing_token,
+            control.remote.clone(),
+        );
         let mut execution = self
             .execute_phase(
                 payload,
@@ -446,6 +480,7 @@ impl Runner {
                 &binary,
                 &environment,
                 &preparation,
+                native.as_mut(),
                 log_stream.writer(),
                 deadline,
                 &control,
@@ -469,7 +504,12 @@ impl Runner {
         execution
     }
 
-    fn start_heartbeat(&self, job_id: &str, remote: CancellationToken) -> JoinHandle<()> {
+    fn start_heartbeat(
+        &self,
+        job_id: &str,
+        fencing_token: u64,
+        remote: CancellationToken,
+    ) -> JoinHandle<()> {
         let client = self.client.clone();
         let metrics = self.metrics.clone();
         let job_id = job_id.to_owned();
@@ -478,12 +518,17 @@ impl Runner {
             let mut last_liveness = Instant::now();
             loop {
                 interval.tick().await;
-                match client.job_status(&job_id).await {
-                    Ok(status) if status.canceled => {
+                match client.job_status_fenced(&job_id, Some(fencing_token)).await {
+                    Ok(status) if status.execution_revoked() => {
                         remote.cancel();
                         return;
                     }
                     Ok(_) => {}
+                    Err(error) if error.execution_revoked() => {
+                        warn!(error = %error, "job authority revoked; stopping execution");
+                        remote.cancel();
+                        return;
+                    }
                     Err(error) => warn!(error = %error, "job cancellation poll failed"),
                 }
                 if last_liveness.elapsed() >= HEARTBEAT_INTERVAL {
@@ -614,6 +659,7 @@ impl Runner {
         binary: &Path,
         environment: &[(String, String)],
         preparation: &Preparation,
+        mut native: Option<&mut NativeSession>,
         log_writer: LogWriter,
         deadline: JobDeadline,
         control: &ExecutionControl,
@@ -631,7 +677,8 @@ impl Runner {
                     .stage_event("init.started", &payload.data.run_id, payload.phase.as_str())
                     .await;
                 let init_status = self
-                    .run_streamed(
+                    .run_phase_command(
+                        native.as_deref_mut(),
                         binary,
                         &init_args,
                         exec_dir,
@@ -689,7 +736,8 @@ impl Runner {
                     .stage_event("plan.started", &payload.data.run_id, payload.phase.as_str())
                     .await;
                 let plan_status = self
-                    .run_streamed(
+                    .run_phase_command(
+                        native.as_deref_mut(),
                         binary,
                         &plan_args,
                         exec_dir,
@@ -712,8 +760,13 @@ impl Runner {
                     )
                     .await;
 
-                let plan_json = self
-                    .capture_json(
+                let plan_json = if let Some(session) = native.as_ref() {
+                    session
+                        .plan_json
+                        .clone()
+                        .context("native owner omitted protected plan JSON")?
+                } else {
+                    self.capture_json(
                         binary,
                         &["show", "-json", "tfplan"],
                         exec_dir,
@@ -723,7 +776,8 @@ impl Runner {
                         control,
                     )
                     .await
-                    .context("capture terraform plan JSON")?;
+                    .context("capture terraform plan JSON")?
+                };
                 let counts = PlanCounts::from_plan(&plan_json);
                 self.await_deadline(
                     deadline,
@@ -744,36 +798,47 @@ impl Runner {
                     )
                     .await;
 
-                match self
-                    .capture_json(
-                        binary,
-                        &["providers", "schema", "-json"],
-                        exec_dir,
-                        work_dir,
-                        environment,
+                if let Some(session) = native.as_ref() {
+                    self.await_deadline(
                         deadline,
-                        control,
+                        "upload native plan evidence",
+                        session.upload(&self.client, payload),
                     )
-                    .await
-                {
-                    Ok(schemas) => {
-                        let path = format!("/api/agent/jobs/{}/provider-schemas", payload.job_id);
-                        if let Err(error) = self
-                            .await_deadline(
-                                deadline,
-                                "upload provider schemas",
-                                self.client.put_text(
-                                    &path,
-                                    schemas.to_string(),
-                                    "application/json",
-                                ),
-                            )
-                            .await
-                        {
-                            warn!(error = %error, "provider schema upload failed");
+                    .await?;
+                    session.copy_plan(&exec_dir.join("tfplan"))?;
+                } else {
+                    match self
+                        .capture_json(
+                            binary,
+                            &["providers", "schema", "-json"],
+                            exec_dir,
+                            work_dir,
+                            environment,
+                            deadline,
+                            control,
+                        )
+                        .await
+                    {
+                        Ok(schemas) => {
+                            let path =
+                                format!("/api/agent/jobs/{}/provider-schemas", payload.job_id);
+                            if let Err(error) = self
+                                .await_deadline(
+                                    deadline,
+                                    "upload provider schemas",
+                                    self.client.put_text(
+                                        &path,
+                                        schemas.to_string(),
+                                        "application/json",
+                                    ),
+                                )
+                                .await
+                            {
+                                warn!(error = %error, "provider schema upload failed");
+                            }
                         }
+                        Err(error) => warn!(error = %error, "provider schema capture failed"),
                     }
-                    Err(error) => warn!(error = %error, "provider schema capture failed"),
                 }
 
                 fs::write(
@@ -812,20 +877,27 @@ impl Runner {
                     completed_at: now_unix_seconds().max(phase_started_at.saturating_add(1)),
                 };
                 let provenance_digest = persist(&manifest, work_dir)?;
-                let snapshot_path = work_dir.join("tmp/plan-snapshot.tar.gz");
-                pack_tar_gz_file(work_dir, &snapshot_path)
-                    .context("pack plan filesystem snapshot")?;
-                self.await_deadline(
-                    deadline,
-                    "upload plan filesystem snapshot",
-                    self.client.put_artifact_file(
-                        &payload.data.filesystem_url,
-                        &snapshot_path,
-                        "application/gzip",
-                    ),
-                )
-                .await
-                .context("upload plan filesystem snapshot")?;
+                // The packer deliberately rejects an archive inside its source.
+                // Keep the bounded upload in a separate owned run directory.
+                let snapshots = PrivateDirectory::new(&self.config.data_dir)?;
+                let snapshot_path = snapshots.path().join("plan-snapshot.tar.gz");
+                let publication: Result<()> = async {
+                    pack_tar_gz_file(work_dir, &snapshot_path)
+                        .context("pack plan filesystem snapshot")?;
+                    self.await_deadline(
+                        deadline,
+                        "upload plan filesystem snapshot",
+                        self.client.put_artifact_file(
+                            &payload.data.filesystem_url,
+                            &snapshot_path,
+                            "application/gzip",
+                        ),
+                    )
+                    .await
+                    .context("upload plan filesystem snapshot")
+                }
+                .await;
+                publication?;
                 self.metrics
                     .stage_event(
                         "snapshot.uploaded",
@@ -875,21 +947,54 @@ impl Runner {
                     .manifest
                     .as_ref()
                     .context("plan filesystem snapshot is missing its execution manifest")?;
-                self.verify_plan_manifest(
-                    payload,
-                    container,
-                    work_dir,
-                    exec_dir,
-                    binary,
-                    environment,
-                    plan_manifest,
-                )?;
+                let mut native_init_error = None;
+                if native.is_none() {
+                    self.verify_plan_manifest(
+                        payload,
+                        container,
+                        work_dir,
+                        exec_dir,
+                        binary,
+                        environment,
+                        plan_manifest,
+                    )?;
+                } else {
+                    let init_args = vec![
+                        "init".to_owned(),
+                        "-no-color".to_owned(),
+                        "-input=false".to_owned(),
+                    ];
+                    match self
+                        .run_phase_command(
+                            native.as_deref_mut(),
+                            binary,
+                            &init_args,
+                            exec_dir,
+                            work_dir,
+                            environment,
+                            &log_writer,
+                            deadline,
+                            control,
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            native_init_error =
+                                Some("native apply initialization failed".to_owned())
+                        }
+                        Err(error) => native_init_error = Some(format_error(&error)),
+                    }
+                }
                 let marker = work_dir.join(APPLY_EXECUTION_MARKER);
-                let apply_error = if marker.is_file() {
+                let mut apply_error = if native_init_error.is_some() {
+                    native_init_error
+                } else if marker.is_file() {
                     read_apply_error(&marker)
                 } else {
                     let result = self
-                        .run_streamed(
+                        .run_phase_command(
+                            native.as_deref_mut(),
                             binary,
                             &apply_args,
                             exec_dir,
@@ -900,7 +1005,7 @@ impl Runner {
                             control,
                         )
                         .await;
-                    let apply_error = match result {
+                    let mut apply_error = match result {
                         Ok(true) => None,
                         Ok(false) => Some("terraform apply failed".to_owned()),
                         Err(error) => {
@@ -946,6 +1051,22 @@ impl Runner {
                             Some(format_error(&error))
                         }
                     };
+                    if let Some(session) = native.as_ref() {
+                        if let Err(error) = self
+                            .await_deadline(
+                                deadline,
+                                "upload native apply evidence",
+                                session.upload(&self.client, payload),
+                            )
+                            .await
+                        {
+                            let upload = format!("native apply evidence upload failed: {error}");
+                            apply_error = Some(match apply_error.take() {
+                                Some(original) => format!("{original}; {upload}"),
+                                None => upload,
+                            });
+                        }
+                    }
                     if let Err(error) = persist_apply_marker(&marker, apply_error.as_deref()) {
                         warn!(
                             path = %marker.display(),
@@ -966,7 +1087,11 @@ impl Runner {
                 // State recovery is deliberately attempted regardless of the
                 // apply exit status. Providers may commit resources before a
                 // later operation fails.
-                let state_path = exec_dir.join(STATE_FILE);
+                // Capture into trusted storage outside the workspace. Opening
+                // the backend's own terraform.tfstate would truncate it before
+                // `state pull` could read it, including after a failed apply.
+                let state_capture_directory = PrivateDirectory::new(&self.config.data_dir)?;
+                let state_path = state_capture_directory.path().join(STATE_FILE);
                 let state_capture = self
                     .capture_state_file(
                         binary,
@@ -974,7 +1099,13 @@ impl Runner {
                         exec_dir,
                         work_dir,
                         environment,
-                        deadline,
+                        if native.is_some() {
+                            JobDeadline {
+                                deadline: Instant::now() + CANCEL_STATE_TIMEOUT,
+                            }
+                        } else {
+                            deadline
+                        },
                         &state_path,
                         control,
                     )
@@ -1099,6 +1230,17 @@ impl Runner {
                     || state_recovery_error.is_some()
                     || state_commit_error.is_some();
                 let state_recovery_error = state_commit_error.or(state_recovery_error);
+                if native.is_some() && apply_error.is_some() {
+                    apply_error = Some(format!(
+                        "{}; infrastructure may already have changed. {}; no rollback was performed",
+                        apply_error.as_deref().unwrap_or("Native apply failed"),
+                        if state_recovered {
+                            "Captured state was retained"
+                        } else {
+                            "State recovery is required"
+                        }
+                    ));
+                }
                 if state_recovery_required {
                     self.metrics
                         .stage_event(
@@ -1287,6 +1429,68 @@ impl Runner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn run_phase_command(
+        &self,
+        native: Option<&mut NativeSession>,
+        binary: &Path,
+        args: &[String],
+        cwd: &Path,
+        work_dir: &Path,
+        environment: &[(String, String)],
+        logs: &LogWriter,
+        deadline: JobDeadline,
+        control: &ExecutionControl,
+    ) -> Result<bool> {
+        let Some(native) = native else {
+            return self
+                .run_streamed(
+                    binary,
+                    args,
+                    cwd,
+                    work_dir,
+                    environment,
+                    logs,
+                    deadline,
+                    control,
+                )
+                .await;
+        };
+        if let Some(reason) = control.reason() {
+            return Err(anyhow::Error::new(JobCanceled {
+                reason,
+                state: None,
+            }));
+        }
+        let canceled = CancellationToken::new();
+        let cancel_signal = canceled.clone();
+        let observed = control.clone();
+        let monitor = tokio::spawn(async move {
+            tokio::select! { _=observed.remote.cancelled()=>{}, _=observed.shutdown.cancelled()=>{}, _=observed.force_shutdown.cancelled()=>{} }
+            cancel_signal.cancel();
+        });
+        let result = native
+            .stage(
+                args.first().context("native stage has no command")?,
+                args,
+                cwd,
+                work_dir,
+                environment,
+                logs,
+                deadline.remaining("native execution")?,
+                canceled,
+            )
+            .await;
+        monitor.abort();
+        if let Some(reason) = control.reason() {
+            return Err(anyhow::Error::new(JobCanceled {
+                reason,
+                state: None,
+            }));
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_streamed(
         &self,
         binary: &Path,
@@ -1363,6 +1567,9 @@ impl Runner {
         output_path: &Path,
         control: &ExecutionControl,
     ) -> Result<StateCapture> {
+        if output_path.starts_with(work_dir) {
+            bail!("state capture output must be outside the run workspace");
+        }
         if let Some(reason) = control.reason() {
             return Err(anyhow::Error::new(JobCanceled {
                 reason,
@@ -1577,6 +1784,7 @@ fn completion_from_result(payload: &AgentJobPayload, result: RunResult) -> Compl
         status,
         error,
         data: CompletionData {
+            fencing_token: Some(payload.data.fencing_token),
             run_id: payload.data.run_id.clone(),
             operation: payload.phase.as_str().to_owned(),
             has_changes: result.counts.has_changes(),
@@ -2352,11 +2560,304 @@ mod tests {
         Runner::new(Client::new(config).unwrap())
     }
 
+    #[tokio::test]
+    async fn fresh_unfenced_completion_works_but_restart_never_replays_it() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for live_completion in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/agent/register"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"agent-1", "agent_pool_id":"pool-1"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/api/agent/status"))
+                .and(body_partial_json(
+                    json!({"job":{"data":{"fencing_token":0}}}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                .expect(u64::from(live_completion))
+                .mount(&server)
+                .await;
+            let temp = tempdir().unwrap();
+            let mut config = test_runner(temp.path().to_owned()).config.clone();
+            config.address = server.uri();
+            let client = Client::new(config).unwrap();
+            client.register().await.unwrap();
+            let runner = Runner::new(client.clone());
+            let journal = Journal::open(temp.path()).unwrap();
+            let manifest =
+                ExecutionManifest::from_payload(&test_payload("job-1", "run-1")).unwrap();
+            let claimed = journal.start(manifest.clone()).unwrap();
+            let executing = journal.mark_executing(&claimed).unwrap();
+            let completion = CompletionJob {
+                status: "finished",
+                error: None,
+                data: serde_json::from_value(json!({
+                    "fencing_token":0,"run_id":"run-1","operation":"plan",
+                    "has_changes":false,"generated_configuration":false,
+                    "action_failures":0,"action_invocations":0
+                }))
+                .unwrap(),
+            };
+            let pending = journal
+                .record_completion(&executing, &completion, None, false)
+                .unwrap();
+            let entry = if live_completion {
+                pending
+            } else {
+                Journal::open(temp.path())
+                    .unwrap()
+                    .unfinished()
+                    .unwrap()
+                    .remove(0)
+            };
+            crate::finish_journal_entry(
+                &client,
+                &runner,
+                &journal,
+                entry,
+                &Metrics::new(),
+                live_completion,
+            )
+            .await
+            .unwrap();
+            let stored = journal.start(manifest).unwrap();
+            assert_eq!(
+                stored.state,
+                if live_completion {
+                    crate::journal::JournalState::CleanupDone
+                } else {
+                    crate::journal::JournalState::RecoveryRequired
+                }
+            );
+            assert_eq!(stored.completion().is_some(), !live_completion);
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_completion_is_retained_without_blocking_claims_and_other_errors_retry() {
+        use crate::journal::JournalState;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for already_pending in [false, true] {
+            for (code, body, stale) in [
+                (409, json!({"errors":[{"code":"stale-agent-lease"}]}), true),
+                (409, json!({"errors":[{"code":"other-conflict"}]}), false),
+                (503, json!({"errors":[{"code":"stale-agent-lease"}]}), false),
+                (429, json!({"error":"throttled"}), false),
+                (401, json!({"error":"unauthorized"}), false),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/api/agent/register"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "id":"agent-1", "agent_pool_id":"pool-1"
+                    })))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path("/api/agent/status"))
+                    .respond_with(ResponseTemplate::new(code).set_body_json(body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let temp = tempdir().unwrap();
+                let mut config = test_runner(temp.path().to_owned()).config.clone();
+                config.address = server.uri();
+                let client = Client::new(config.clone()).unwrap();
+                client.register().await.unwrap();
+                let runner = Runner::new(client.clone());
+                let journal = Journal::open(temp.path()).unwrap();
+                let directory = RunDirectory::create(temp.path()).unwrap();
+                let state_path = directory.path().join("terraform.tfstate");
+                fs::write(&state_path, b"retained-state").unwrap();
+                let mut manifest =
+                    ExecutionManifest::from_payload(&test_payload("job-1", "run-1")).unwrap();
+                manifest.fencing_token = 7;
+                manifest.native_policy = true;
+                manifest.phase = "apply".to_owned();
+                manifest.work_dir = Some(directory.path().to_owned());
+                let claimed = journal.start(manifest.clone()).unwrap();
+                let mut entry = journal.mark_executing(&claimed).unwrap();
+                if already_pending {
+                    let completion = CompletionJob {
+                        status: "errored",
+                        error: Some("original apply failure".to_owned()),
+                        data: serde_json::from_value(json!({
+                            "fencing_token":7,"run_id":"run-1","operation":"apply",
+                            "has_changes":false,"generated_configuration":false,
+                            "action_failures":1,"action_invocations":1,"state":"{\"version\":4}"
+                        }))
+                        .unwrap(),
+                    };
+                    entry = journal
+                        .record_completion(&entry, &completion, manifest.work_dir.clone(), false)
+                        .unwrap();
+                }
+                let result = crate::finish_journal_entry(
+                    &client,
+                    &runner,
+                    &journal,
+                    entry,
+                    &Metrics::new(),
+                    false,
+                )
+                .await;
+                assert_eq!(result.is_ok(), stale);
+                let reopened = Journal::open(temp.path()).unwrap();
+                let retained = reopened.start(manifest.clone()).unwrap();
+                assert_eq!(retained.manifest.fencing_token, 7);
+                assert_eq!(retained.manifest.work_dir, manifest.work_dir);
+                assert_eq!(retained.completion().unwrap().data.fencing_token, Some(7));
+                if already_pending {
+                    assert_eq!(
+                        retained.completion().unwrap().error.as_deref(),
+                        Some("original apply failure")
+                    );
+                    assert_eq!(
+                        retained.completion().unwrap().data.state.as_deref(),
+                        Some("{\"version\":4}")
+                    );
+                }
+                assert_eq!(fs::read(&state_path).unwrap(), b"retained-state");
+                if stale {
+                    assert_eq!(retained.state, JournalState::RecoveryRequired);
+                    assert!(retained.retain_work_dir);
+                    assert!(reopened.unfinished().unwrap().is_empty());
+                    Mock::given(method("GET"))
+                        .and(path("/api/agent/jobs"))
+                        .respond_with(ResponseTemplate::new(204))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    assert_eq!(
+                        crate::poll_once(
+                            &client,
+                            &runner,
+                            &reopened,
+                            &config,
+                            &Metrics::new(),
+                            &CancellationToken::new()
+                        )
+                        .await
+                        .unwrap(),
+                        crate::PollResult::Idle
+                    );
+                } else {
+                    assert_eq!(retained.state, JournalState::CompletionPending);
+                    assert_eq!(reopened.unfinished().unwrap().len(), 1);
+                    server.verify().await;
+                    server.reset().await;
+                    Mock::given(method("PUT"))
+                        .and(path("/api/agent/status"))
+                        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    crate::finish_journal_entry(
+                        &client,
+                        &runner,
+                        &reopened,
+                        retained,
+                        &Metrics::new(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        reopened.start(manifest).unwrap().state,
+                        JournalState::CleanupDone
+                    );
+                }
+                server.verify().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_cancels_revoked_claims_but_keeps_transient_errors_retryable() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (code, body, revoked) in [
+            (200, json!({"status":"claimed","canceled":true}), true),
+            (200, json!({"status":"errored","canceled":false}), true),
+            (200, json!({"status":"completed"}), true),
+            (200, json!({"status":"queued"}), true),
+            (401, json!({"error":"unauthorized"}), true),
+            (403, json!({"error":"forbidden"}), true),
+            (404, json!({"error":"not found"}), true),
+            (409, json!({"error":"stale lease"}), true),
+            (200, json!({"status":"claimed","canceled":false}), false),
+            (429, json!({"error":"retry later"}), false),
+            (503, json!({"error":"unavailable"}), false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/agent/register"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id":"agent-1", "agent_pool_id":"pool-1"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/api/agent/jobs/job-1/status"))
+                .and(query_param("fencing_token", "7"))
+                .respond_with(ResponseTemplate::new(code).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let temp = tempdir().unwrap();
+            let mut config = test_runner(temp.path().to_owned()).config.clone();
+            config.address = server.uri();
+            let client = Client::new(config).unwrap();
+            client.register().await.unwrap();
+            let runner = Runner::new(client);
+            let canceled = CancellationToken::new();
+            let heartbeat = runner.start_heartbeat("job-1", 7, canceled.clone());
+            if revoked {
+                time::timeout(Duration::from_secs(2), canceled.cancelled())
+                    .await
+                    .expect("definite lease revocation must cancel active execution");
+                heartbeat.await.unwrap();
+            } else {
+                // The first interval tick is immediate. Wait until the request
+                // has arrived, then ensure transient failures leave it active.
+                time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if server.received_requests().await.unwrap().len() >= 2 {
+                            break;
+                        }
+                        time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                time::sleep(Duration::from_millis(20)).await;
+                assert!(!canceled.is_cancelled());
+                assert!(!heartbeat.is_finished());
+                heartbeat.abort();
+                let _ = heartbeat.await;
+            }
+            server.verify().await;
+        }
+    }
+
     fn test_payload(job_id: &str, run_id: &str) -> AgentJobPayload {
         AgentJobPayload {
             phase: Phase::Plan,
             job_id: job_id.to_owned(),
             data: JobData {
+                fencing_token: 0,
+                native_policy_url: None,
+                native_result_url: None,
                 organization_name: "org".to_owned(),
                 workspace_name: "workspace".to_owned(),
                 operation: "plan".to_owned(),
@@ -2428,6 +2929,53 @@ mod tests {
         let mut restored = String::new();
         decoder.read_to_string(&mut restored).unwrap();
         assert_eq!(restored, state);
+    }
+
+    #[tokio::test]
+    async fn state_capture_preserves_the_local_backend_file() {
+        let temp = tempdir().unwrap();
+        let work = temp.path().join("work");
+        ensure_private_dir(&work, "test work").unwrap();
+        let state = br#"{"version":4,"serial":1,"lineage":"proof","resources":[]}"#;
+        let backend = work.join("terraform.tfstate");
+        fs::write(&backend, state).unwrap();
+        let runner = test_runner(temp.path().join("data"));
+        let control = ExecutionControl {
+            remote: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            force_shutdown: CancellationToken::new(),
+        };
+        let rejected = runner
+            .capture_state_file(
+                Path::new("/usr/bin/cat"),
+                &["terraform.tfstate"],
+                &work,
+                &work,
+                &[],
+                JobDeadline::parse("10s").unwrap(),
+                &backend,
+                &control,
+            )
+            .await;
+        assert!(rejected.is_err());
+        assert_eq!(fs::read(&backend).unwrap(), state);
+        let output = temp.path().join("captured.json");
+        let captured = runner
+            .capture_state_file(
+                Path::new("/usr/bin/cat"),
+                &["terraform.tfstate"],
+                &work,
+                &work,
+                &[],
+                JobDeadline::parse("10s").unwrap(),
+                &output,
+                &control,
+            )
+            .await
+            .unwrap();
+        assert!(captured.command_error.is_none());
+        assert_eq!(fs::read(&backend).unwrap(), state);
+        assert_eq!(fs::read(&output).unwrap(), state);
     }
 
     #[test]

@@ -5,6 +5,7 @@ mod diagnostics;
 mod journal;
 mod logs;
 mod manifest;
+mod native;
 mod observability;
 mod protocol;
 mod provenance;
@@ -287,7 +288,7 @@ async fn poll_once(
     }
     metrics.poll_started();
     if let Some(entry) = journal.unfinished()?.into_iter().next() {
-        finish_journal_entry(client, runner, journal, entry, metrics).await?;
+        finish_journal_entry(client, runner, journal, entry, metrics, false).await?;
         return Ok(PollResult::Idle);
     }
     let claim = tokio::select! {
@@ -317,7 +318,7 @@ async fn poll_once(
     let manifest = ExecutionManifest::from_payload(&payload)?;
     let journal_entry = journal.start(manifest)?;
     if journal_entry.state != JournalState::Claimed {
-        finish_journal_entry(client, runner, journal, journal_entry, metrics).await?;
+        finish_journal_entry(client, runner, journal, journal_entry, metrics, false).await?;
         return Ok(PollResult::Idle);
     }
     let journal_entry = journal.mark_executing(&journal_entry)?;
@@ -338,7 +339,8 @@ async fn poll_once(
         Some(&payload.data.run_id),
         Some(payload.phase.as_str()),
     );
-    let finish_result = finish_journal_entry(client, runner, journal, journal_entry, metrics).await;
+    let finish_result =
+        finish_journal_entry(client, runner, journal, journal_entry, metrics, true).await;
     metrics.job_finished(completion_status == "finished");
     metrics.clear_job().await;
     finish_result?;
@@ -377,39 +379,93 @@ async fn report_completion_details(
     }
 }
 
+/// Acknowledge only accepted completions. An explicit stale-lease response is
+/// terminal locally, preserving all original recovery data without retrying it.
+async fn acknowledge_journal_completion(
+    client: &Client,
+    journal: &Journal,
+    entry: &JournalEntry,
+    metrics: &Metrics,
+) -> Result<JournalEntry> {
+    let completion = entry
+        .completion()
+        .cloned()
+        .context("completion-pending journal entry has no completion")?;
+    match report_completion_details(
+        client,
+        &entry.manifest.phase,
+        &entry.manifest.run_id,
+        completion,
+        metrics,
+    )
+    .await
+    {
+        Ok(()) => journal.mark_completion_acked(entry),
+        Err(error)
+            if error
+                .downcast_ref::<ClientError>()
+                .is_some_and(ClientError::stale_completion_lease) =>
+        {
+            let retained = journal.quarantine_stale_completion(entry)?;
+            error!(
+                job_id = %retained.manifest.job_id,
+                run_id = %retained.manifest.run_id,
+                work_dir = ?retained.manifest.work_dir,
+                "stale completion lease requires operator reconciliation; original completion and state retained without replay or acknowledgement"
+            );
+            Ok(retained)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 async fn finish_journal_entry(
     client: &Client,
     runner: &Runner,
     journal: &Journal,
     entry: JournalEntry,
     metrics: &Metrics,
+    live_completion: bool,
 ) -> Result<()> {
+    // Older servers may omit fencing even for newly claimed work. Its live
+    // completion can use that original contract, but a restart/redelivery may
+    // never assume that an old unfenced lease is still authoritative.
+    let live_legacy_completion = live_completion
+        && !entry.manifest.native_policy
+        && entry.manifest.fencing_token == 0
+        && entry
+            .completion()
+            .is_some_and(|completion| completion.data.fencing_token == Some(0));
+    if entry.needs_unfenced_recovery() && !live_legacy_completion {
+        let retained = journal.quarantine_unfenced(&entry)?;
+        error!(
+            job_id = %retained.manifest.job_id,
+            run_id = %retained.manifest.run_id,
+            work_dir = ?retained.manifest.work_dir,
+            "unfenced execution requires operator reconciliation; original completion and state retained, not replayed or acknowledged"
+        );
+        return Ok(());
+    }
     let entry = match entry.state {
         JournalState::CompletionPending => {
-            let completion = entry
-                .completion()
-                .cloned()
-                .context("completion-pending journal entry has no completion")?;
-            report_completion_details(
-                client,
-                &entry.manifest.phase,
-                &entry.manifest.run_id,
-                completion,
-                metrics,
-            )
-            .await?;
-            journal.mark_completion_acked(&entry)?
+            acknowledge_journal_completion(client, journal, &entry, metrics).await?
         }
         JournalState::CompletionAcked => entry,
-        JournalState::CleanupDone => return Ok(()),
+        JournalState::CleanupDone | JournalState::RecoveryRequired => return Ok(()),
         JournalState::Claimed | JournalState::Executing => {
             // A process restart can leave only the execution marker behind.
-            // Terminalize that stale claim instead of retrying the job or
-            // blocking every subsequent poll forever.
+            // Never replay the stale claim. A native apply retains its local
+            // directory and remains unacknowledged until state is recovered.
+            let native_apply = entry.manifest.native_policy && entry.manifest.phase == "apply";
             let completion = CompletionJob {
                 status: "errored",
-                error: Some("agent restarted before durable completion".to_owned()),
+                error: Some(if native_apply {
+                    "Agent restarted during native apply; infrastructure may have changed. The local execution directory is retained for state recovery; no rollback occurred.".to_owned()
+                } else {
+                    "agent restarted before durable completion".to_owned()
+                }),
                 data: CompletionData {
+                    fencing_token: Some(entry.manifest.fencing_token),
                     run_id: entry.manifest.run_id.clone(),
                     operation: entry.manifest.phase.clone(),
                     has_changes: false,
@@ -426,7 +482,7 @@ async fn finish_journal_entry(
                     provenance_digest: None,
                     log_incomplete: None,
                     state_recovered: false,
-                    state_recovery_required: false,
+                    state_recovery_required: native_apply,
                     apply_error: None,
                     state_recovery_error: None,
                     lifecycle: Some("agent_restarted".to_owned()),
@@ -439,19 +495,14 @@ async fn finish_journal_entry(
                 &entry,
                 &completion,
                 entry.manifest.work_dir.clone(),
-                false,
+                native_apply,
             )?;
-            report_completion_details(
-                client,
-                &entry.manifest.phase,
-                &entry.manifest.run_id,
-                completion,
-                metrics,
-            )
-            .await?;
-            journal.mark_completion_acked(&pending)?
+            acknowledge_journal_completion(client, journal, &pending, metrics).await?
         }
     };
+    if entry.state == JournalState::RecoveryRequired {
+        return Ok(());
+    }
     if entry.retain_work_dir {
         warn!(
             job_id = %entry.manifest.job_id,

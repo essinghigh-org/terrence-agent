@@ -14,6 +14,12 @@ use crate::protocol::AgentJobPayload;
 /// out of the journal metadata.
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct ExecutionManifest {
+    #[serde(skip)]
+    pub legacy_fingerprint: Option<String>,
+    #[serde(default)]
+    pub fencing_token: u64,
+    #[serde(default)]
+    pub native_policy: bool,
     pub job_id: String,
     pub run_id: String,
     pub phase: String,
@@ -25,6 +31,13 @@ pub struct ExecutionManifest {
 impl ExecutionManifest {
     pub fn from_payload(payload: &AgentJobPayload) -> Result<Self> {
         Ok(Self {
+            legacy_fingerprint: if payload.data.native_policy_url.is_none() {
+                Some(fingerprint(payload, true)?)
+            } else {
+                None
+            },
+            fencing_token: payload.data.fencing_token,
+            native_policy: payload.data.native_policy_url.is_some(),
             job_id: payload.job_id.clone(),
             run_id: payload.data.run_id.clone(),
             phase: payload.phase.as_str().to_owned(),
@@ -40,9 +53,20 @@ impl ExecutionManifest {
 }
 
 pub fn payload_fingerprint(payload: &AgentJobPayload) -> Result<String> {
+    fingerprint(payload, false)
+}
+
+fn fingerprint(payload: &AgentJobPayload, legacy: bool) -> Result<String> {
     let mut value =
         serde_json::to_value(payload).context("serialize job payload for fingerprint")?;
     strip_rotating_fields(&mut value);
+    if legacy {
+        // Released clients did not deserialize this field. Reconstruct their
+        // fingerprint only for matching an existing unfenced, non-native claim.
+        if let Some(data) = value.get_mut("data").and_then(Value::as_object_mut) {
+            data.remove("fencing_token");
+        }
+    }
     let mut canonical = Vec::new();
     write_canonical(&value, &mut canonical).context("canonicalize job payload")?;
     let mut hasher = Sha256::new();
@@ -62,6 +86,8 @@ fn strip_rotating_fields(value: &mut Value) {
                 "terraform_log_url",
                 "json_plan_url",
                 "state_artifact_url",
+                "native_policy_url",
+                "native_result_url",
             ] {
                 values.remove(key);
             }
@@ -121,6 +147,9 @@ mod tests {
             phase: Phase::Plan,
             job_id: "job-1".to_owned(),
             data: JobData {
+                fencing_token: 0,
+                native_policy_url: None,
+                native_result_url: None,
                 organization_name: "org".to_owned(),
                 workspace_name: "workspace".to_owned(),
                 operation: "plan".to_owned(),
@@ -189,6 +218,33 @@ mod tests {
         assert_ne!(
             payload_fingerprint(&first).unwrap(),
             payload_fingerprint(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn released_fingerprint_remains_matchable_without_weakening_new_lease_identity() {
+        let mut current = payload(HashMap::new());
+        current.data.fencing_token = 7;
+        let manifest = ExecutionManifest::from_payload(&current).unwrap();
+        // Golden value produced by the released 759958f serializer and
+        // fingerprint implementation, before fencing_token was deserialized.
+        assert_eq!(
+            manifest.legacy_fingerprint.as_deref(),
+            Some("44fb8dbc257db581acf81db2540cb5b2e9022f7b7c2e64032a92d854c114b5cb")
+        );
+        current.data.fencing_token = 8;
+        assert_ne!(manifest.fingerprint, payload_fingerprint(&current).unwrap());
+        current.data.native_policy_url = Some("/native-policy".to_owned());
+        assert!(
+            ExecutionManifest::from_payload(&current)
+                .unwrap()
+                .legacy_fingerprint
+                .is_none()
+        );
+        assert!(
+            !serde_json::to_string(&manifest)
+                .unwrap()
+                .contains("legacy_fingerprint")
         );
     }
 

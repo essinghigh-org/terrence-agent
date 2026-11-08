@@ -24,6 +24,10 @@ pub struct AgentRegistration {
     pub iac_binaries: Vec<String>,
     pub accept: String,
     pub request_forwarding: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protocol_versions: Vec<String>,
 }
 
 pub const MAX_ID_LENGTH: usize = 200;
@@ -499,6 +503,12 @@ impl AgentJobPayload {
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct JobData {
+    #[serde(default)]
+    pub fencing_token: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_url")]
+    pub native_policy_url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_url")]
+    pub native_result_url: Option<String>,
     #[allow(dead_code)]
     #[serde(deserialize_with = "deserialize_name")]
     pub organization_name: String,
@@ -617,6 +627,8 @@ pub struct CompletionJob {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CompletionData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_token: Option<u64>,
     pub run_id: String,
     pub operation: String,
     pub has_changes: bool,

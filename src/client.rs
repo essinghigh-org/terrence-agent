@@ -90,6 +90,7 @@ pub enum ClientError {
 #[derive(Clone)]
 pub struct Client {
     control_http: reqwest::Client,
+    extra_roots: Vec<reqwest::Certificate>,
     artifact_http: reqwest::Client,
     config: Arc<Config>,
     base_url: Url,
@@ -125,6 +126,63 @@ impl ArtifactUrl {
 pub struct JobStatus {
     #[serde(default)]
     pub canceled: bool,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+impl JobStatus {
+    /// Stop effects when the server explicitly reports that the claim is no
+    /// longer active. Older responses may only include the cancellation flag.
+    pub fn execution_revoked(&self) -> bool {
+        self.canceled
+            || matches!(
+                self.status.as_deref(),
+                Some("completed" | "errored" | "canceled" | "queued")
+            )
+    }
+}
+
+impl ClientError {
+    /// Only the server's explicit stale-lease code is a terminal completion
+    /// rejection. Other conflicts, authentication errors and outages may retry.
+    pub fn stale_completion_lease(&self) -> bool {
+        let Self::Http { status, body, .. } = self else {
+            return false;
+        };
+        *status == StatusCode::CONFLICT
+            && serde_json::from_str::<Value>(body)
+                .ok()
+                .is_some_and(|body| {
+                    body.get("errors")
+                        .and_then(Value::as_array)
+                        .is_some_and(|errors| {
+                            errors.iter().any(|error| {
+                                error.get("code").and_then(Value::as_str)
+                                    == Some("stale-agent-lease")
+                            })
+                        })
+                })
+    }
+
+    /// A definite loss of job authority must stop execution immediately;
+    /// transport failures, throttling and server errors remain retryable.
+    pub fn execution_revoked(&self) -> bool {
+        match self {
+            Self::Auth(_) => true,
+            Self::Http { status, .. } => matches!(status.as_u16(), 401 | 403 | 404 | 409),
+            _ => false,
+        }
+    }
+}
+
+fn native_tls(
+    mut builder: reqwest::ClientBuilder,
+    certificates: &[reqwest::Certificate],
+) -> reqwest::ClientBuilder {
+    for certificate in certificates {
+        builder = builder.add_root_certificate(certificate.clone());
+    }
+    builder
 }
 
 impl Client {
@@ -150,13 +208,14 @@ impl Client {
         let artifact_idle_timeout = Duration::from_millis(
             env_u64("TERRENCE_AGENT_ARTIFACT_IDLE_TIMEOUT_MS", 30_000)?.clamp(1_000, 600_000),
         );
-        let control_http = reqwest::Client::builder()
+        let extra_roots = crate::native::trust_certificates()?;
+        let control_http = native_tls(reqwest::Client::builder(), &extra_roots)
             .redirect(Policy::none())
             .user_agent(format!("terrence-agent/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(CONTROL_CONNECT_TIMEOUT)
             .timeout(MAX_REQUEST_TIMEOUT)
             .build()?;
-        let artifact_http = reqwest::Client::builder()
+        let artifact_http = native_tls(reqwest::Client::builder(), &extra_roots)
             .redirect(Policy::none())
             .user_agent(format!("terrence-agent/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(CONTROL_CONNECT_TIMEOUT)
@@ -164,6 +223,7 @@ impl Client {
             .build()?;
         Ok(Self {
             control_http,
+            extra_roots,
             artifact_http,
             base_url,
             artifact_hosts: Arc::new(artifact_hosts),
@@ -183,6 +243,12 @@ impl Client {
     }
 
     pub async fn register(&self) -> Result<String, ClientError> {
+        let native_capabilities = crate::native::registration_capabilities(&self.config)
+            .await
+            .map_err(|error| ClientError::Transport {
+                path: "/api/agent/register".to_owned(),
+                reason: error.to_string(),
+            })?;
         let body = AgentRegistration {
             name: self.config.display_name.clone(),
             display_name: self.config.display_name.clone(),
@@ -199,6 +265,12 @@ impl Client {
                 .collect(),
             accept: self.config.accept.clone(),
             request_forwarding: request_forwarding_enabled(),
+            protocol_versions: if native_capabilities.is_some() {
+                vec!["1".to_owned()]
+            } else {
+                vec![]
+            },
+            capabilities: native_capabilities,
         };
         let request = self
             .control_http
@@ -250,13 +322,25 @@ impl Client {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn job_status(&self, job_id: &str) -> Result<JobStatus, ClientError> {
+        self.job_status_fenced(job_id, None).await
+    }
+
+    pub async fn job_status_fenced(
+        &self,
+        job_id: &str,
+        fencing_token: Option<u64>,
+    ) -> Result<JobStatus, ClientError> {
         if crate::protocol::ValidatedId::new(job_id).is_err() {
             return Err(ClientError::InvalidPath {
                 path: job_id.to_owned(),
             });
         }
-        let path = format!("/api/agent/jobs/{job_id}/status");
+        let path = match fencing_token {
+            Some(token) => format!("/api/agent/jobs/{job_id}/status?fencing_token={token}"),
+            None => format!("/api/agent/jobs/{job_id}/status"),
+        };
         let request = self
             .control_http
             .get(self.api_url(&path))
@@ -266,36 +350,20 @@ impl Client {
     }
 
     pub async fn deregister(&self) -> Result<(), ClientError> {
-        // Best-effort: a graceful shutdown requests deregistration so the
-        // server can free the agent slot. Retry transient failures, but never
-        // report an HTTP error as a successful deregistration.
-        let path = "/api/agent/register";
+        // The server's agent contract uses a terminal status heartbeat to free
+        // the slot. It does not define DELETE /api/agent/register.
         let mut delay = Duration::from_millis(100);
         for attempt in 0..3 {
-            let request = self
-                .control_http
-                .delete(self.api_url(path))
-                .headers(self.agent_headers().await?)
-                .timeout(HEARTBEAT_TIMEOUT);
-            match request.send().await {
-                Ok(response) if response.status().is_success() => return Ok(()),
-                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                    return Err(ClientError::Auth(path.to_owned()));
+            match self.put_status("exited", None).await {
+                Ok(()) => return Ok(()),
+                Err(error @ ClientError::Auth(_)) => return Err(error),
+                Err(error @ ClientError::Http { status, .. }) if !status.is_server_error() => {
+                    return Err(error);
                 }
-                Ok(response) if response.status().is_server_error() && attempt < 2 => {
+                Err(error) if attempt == 2 => return Err(error),
+                Err(_) => {
                     tokio::time::sleep(delay).await;
                     delay *= 2;
-                }
-                Ok(response) => return Err(self.http_error(response, path).await),
-                Err(_source) if attempt < 2 => {
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-                Err(source) => {
-                    return Err(ClientError::Network {
-                        path: path.to_owned(),
-                        source,
-                    });
                 }
             }
         }
@@ -681,6 +749,50 @@ impl Client {
         self.send_empty(request, &path).await
     }
 
+    /// Native manifests contain owner-only credentials; use the authenticated
+    /// control origin and never follow redirects or send them to artifact hosts.
+    pub async fn native_json(
+        &self,
+        url: &str,
+        value: Option<&Value>,
+    ) -> Result<Value, ClientError> {
+        let artifact = self.resolve_url(url)?;
+        if artifact.as_url().origin() != self.base_url.origin() {
+            return Err(ClientError::UnsafeUrl {
+                value: "native artifact".to_owned(),
+                reason: "native artifacts must use the control origin".to_owned(),
+            });
+        }
+        let path = artifact.as_url().path().to_owned();
+        let mut request = self
+            .control_http
+            .request(
+                if value.is_some() {
+                    Method::PUT
+                } else {
+                    Method::GET
+                },
+                artifact.as_url().clone(),
+            )
+            .headers(self.agent_headers().await?)
+            .timeout(Duration::from_secs(60));
+        if let Some(value) = value {
+            request = request.json(value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|source| ClientError::Network {
+                path: path.clone(),
+                source,
+            })?;
+        if !response.status().is_success() {
+            return Err(self.http_error(response, &path).await);
+        }
+        let bytes = limited_bytes(response, &path, 64 * 1024 * 1024).await?;
+        serde_json::from_slice(&bytes).map_err(|source| ClientError::Decode { path, source })
+    }
+
     pub async fn put_text(
         &self,
         url: &str,
@@ -896,7 +1008,7 @@ impl Client {
         {
             return Ok(client);
         }
-        let client = reqwest::Client::builder()
+        let client = native_tls(reqwest::Client::builder(), &self.extra_roots)
             .redirect(Policy::none())
             .user_agent(format!("terrence-agent/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(CONTROL_CONNECT_TIMEOUT)
@@ -1577,6 +1689,7 @@ mod tests {
                     status: "finished",
                     error: None,
                     data: CompletionData {
+                        fencing_token: None,
                         run_id: "run-test".to_owned(),
                         operation: "plan".to_owned(),
                         has_changes: false,
@@ -1739,5 +1852,58 @@ mod tests {
                 Err(ClientError::InvalidPath { .. })
             ));
         }
+    }
+
+    #[test]
+    fn stale_completion_requires_the_explicit_server_code() {
+        for body in [
+            "",
+            "not JSON",
+            "{}",
+            "{\"errors\":[{\"detail\":\"stale-agent-lease\"}]}",
+        ] {
+            assert!(
+                !ClientError::Http {
+                    path: "/api/agent/status".to_owned(),
+                    status: StatusCode::CONFLICT,
+                    body: body.to_owned(),
+                }
+                .stale_completion_lease()
+            );
+        }
+        assert!(!ClientError::Auth("expired token".to_owned()).stale_completion_lease());
+    }
+
+    #[test]
+    fn job_authority_distinguishes_revocation_from_transient_failure() {
+        for status in ["completed", "errored", "canceled", "queued"] {
+            let status: JobStatus = serde_json::from_value(json!({"status":status})).unwrap();
+            assert!(status.execution_revoked());
+        }
+        for body in [json!({}), json!({"status":"claimed"})] {
+            let status: JobStatus = serde_json::from_value(body).unwrap();
+            assert!(!status.execution_revoked());
+        }
+        let canceled: JobStatus = serde_json::from_value(json!({"canceled":true})).unwrap();
+        assert!(canceled.execution_revoked());
+        assert!(ClientError::Auth("revoked".to_owned()).execution_revoked());
+        for code in [401, 403, 404, 409, 429, 500, 502, 503] {
+            let error = ClientError::Http {
+                path: "/api/agent/jobs/job/status".to_owned(),
+                status: StatusCode::from_u16(code).unwrap(),
+                body: String::new(),
+            };
+            assert_eq!(
+                error.execution_revoked(),
+                matches!(code, 401 | 403 | 404 | 409)
+            );
+        }
+        assert!(
+            !ClientError::RetryAfter {
+                path: "/api/agent/jobs/job/status".to_owned(),
+                delay: Duration::from_secs(1),
+            }
+            .execution_revoked()
+        );
     }
 }
